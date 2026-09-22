@@ -5,9 +5,14 @@ Used by the ready-for-review workflow to keep a Linear issue's state in
 sync with the PR working on it - "In Progress" when the PR opens,
 "In Review" (plus a specific assignee) when the PR flips to ready.
 
-If the target state doesn't exist yet for the issue's team, it's
-created (type "started", positioned right after "In Progress") rather
-than failing - this is meant to work without per-team manual setup.
+The target state must already exist for the issue's team. Creating a
+workflow state via the API was tried and confirmed to fail even with a
+"write"-scoped token ("not allowed to create workflow states for this
+team") - it appears to require full workspace-admin permission that
+isn't safe to assume any configured credential has. If the state is
+missing, this fails with a clear message telling you to add it once,
+manually, in Linear's own UI (Team settings -> Workflow -> add a state,
+type "Started") - a one-time thing per team, not per run.
 
 Usage:
     LINEAR_API_KEY=... python3 linear_issue_transition.py \\
@@ -28,6 +33,11 @@ import os
 import sys
 import urllib.request
 
+
+class LinearApiError(RuntimeError):
+    """A Linear API call failed - distinct from argument/env errors."""
+
+
 GRAPHQL_URL = "https://api.linear.app/graphql"
 
 
@@ -42,41 +52,32 @@ def gql(token: str, query: str, variables: dict) -> dict:
     with urllib.request.urlopen(req) as resp:
         result = json.loads(resp.read())
     if "errors" in result:
-        raise SystemExit(f"Linear API error: {result['errors']}")
+        raise LinearApiError(f"Linear API error: {result['errors']}")
     return result["data"]
 
 
 def find_issue_and_states(token: str, identifier: str) -> tuple[str, list[dict]]:
     data = gql(
         token,
-        "query($id: String!) { issue(id: $id) { id team { id states { nodes { id name type } } } } }",
+        "query($id: String!) { issue(id: $id) { id team { name states { nodes { id name } } } } }",
         {"id": identifier},
     )
     issue = data.get("issue")
     if not issue:
-        raise SystemExit(f"Issue {identifier!r} not found")
-    return issue["id"], issue["team"]["id"], issue["team"]["states"]["nodes"]
+        raise LinearApiError(f"Issue {identifier!r} not found")
+    return issue["id"], issue["team"]["name"], issue["team"]["states"]["nodes"]
 
 
-def find_or_create_state(token: str, team_id: str, states: list[dict], name: str) -> str:
+def find_state(team_name: str, states: list[dict], name: str) -> str:
     for state in states:
         if state["name"].lower() == name.lower():
             return state["id"]
-
-    # Not found - create it. Position it right after "In Progress" if that
-    # exists, otherwise just let Linear place it.
-    in_progress = next((s for s in states if s["name"].lower() == "in progress"), None)
-    input_ = {"teamId": team_id, "name": name, "type": "started", "color": "#f2c94c"}
-    if in_progress:
-        # Linear positions by a float; nudge just after the reference state.
-        input_["position"] = 1
-    data = gql(
-        token,
-        "mutation($input: WorkflowStateCreateInput!) { "
-        "workflowStateCreate(input: $input) { success workflowState { id } } }",
-        {"input": input_},
+    existing = ", ".join(s["name"] for s in states)
+    raise LinearApiError(
+        f"Team {team_name!r} has no {name!r} workflow state (has: {existing}). "
+        f"Add it once in Linear: Team settings -> Workflow -> add a state named "
+        f"{name!r}, type \"Started\" - the API can't create this reliably."
     )
-    return data["workflowStateCreate"]["workflowState"]["id"]
 
 
 def update_issue(token: str, issue_id: str, state_id: str, assignee_id: str | None) -> None:
@@ -106,13 +107,13 @@ def main() -> int:
     ok = True
     for identifier in args.identifiers:
         try:
-            issue_id, team_id, states = find_issue_and_states(token, identifier)
-            state_id = find_or_create_state(token, team_id, states, args.to_state)
+            issue_id, team_name, states = find_issue_and_states(token, identifier)
+            state_id = find_state(team_name, states, args.to_state)
             update_issue(token, issue_id, state_id, args.assignee_id)
             print(f"{identifier}: moved to {args.to_state!r}" + (
                 f", assigned to {args.assignee_id}" if args.assignee_id else ""
             ))
-        except Exception as exc:  # noqa: BLE001 - report and continue with other identifiers
+        except LinearApiError as exc:
             print(f"{identifier}: FAILED - {exc}", file=sys.stderr)
             ok = False
 

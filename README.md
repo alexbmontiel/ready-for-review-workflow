@@ -17,9 +17,14 @@ remember to do it by hand:
 Both directions read the issue identifier(s) straight out of the PR body
 (`Closes HOM-47`, `Fixes THE-12`, etc. - same convention Linear's own
 magic words use), and both are best-effort: a Linear API hiccup logs a
-warning and never blocks the actual PR mechanics. If the referenced
-issue's team doesn't have an "In Review" state yet, one is created
-automatically the first time it's needed - no manual per-team setup.
+warning and never blocks the actual PR mechanics. **The target state
+must already exist for the issue's team** - creating a workflow state via
+the API was tried and confirmed to fail even with a write-scoped token
+("not allowed to create workflow states for this team"), so this doesn't
+attempt it. Add "In Review" once per team, manually, in Linear: Team
+settings → Workflow → add a state, type "Started". A missing state fails
+with a clear message naming exactly what to add, same as any other
+Linear-sync failure - it doesn't block the PR.
 
 This is a separate concern from Linear's native GitHub integration (which
 handles the diff-tab/PR-linking UI, and just needs to be connected once
