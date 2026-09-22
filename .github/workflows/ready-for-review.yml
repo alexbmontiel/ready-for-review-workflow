@@ -53,16 +53,22 @@ jobs:
   sync-linear-on-open:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && github.event.action == 'opened'
+    env:
+      # `secrets` isn't a valid context in `if:` expressions (confirmed via
+      # actionlint - not just undocumented, actively rejected). Route it
+      # through `env` instead, which is allowed there, so the sync step
+      # below can check presence without a workaround script.
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
     steps:
       - name: Checkout (for the transition script)
+        if: env.LINEAR_API_KEY != ''
         uses: actions/checkout@v4
         with:
           repository: alexbmontiel/ready-for-review-workflow
           sparse-checkout: scripts
       - name: Move referenced issue(s) to In Progress
-        if: secrets.LINEAR_API_KEY != ''
+        if: env.LINEAR_API_KEY != ''
         env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
@@ -84,6 +90,8 @@ jobs:
 
   check-and-flip:
     runs-on: ubuntu-latest
+    env:
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
     steps:
       - name: Resolve the PR number for this event
         id: pr
@@ -162,16 +170,15 @@ jobs:
           echo "flipped=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout (for the transition script)
-        if: steps.flip.outputs.flipped == 'true' && secrets.LINEAR_API_KEY != ''
+        if: steps.flip.outputs.flipped == 'true' && env.LINEAR_API_KEY != ''
         uses: actions/checkout@v4
         with:
           repository: alexbmontiel/ready-for-review-workflow
           sparse-checkout: scripts
 
       - name: Move referenced issue(s) to In Review
-        if: steps.flip.outputs.flipped == 'true' && secrets.LINEAR_API_KEY != ''
+        if: steps.flip.outputs.flipped == 'true' && env.LINEAR_API_KEY != ''
         env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           PR_BODY: ${{ steps.flip.outputs.body }}
           REVIEWER_ID: ${{ inputs.linear_reviewer_id }}
         run: |
