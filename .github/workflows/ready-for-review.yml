@@ -6,6 +6,13 @@ name: Ready for review check
 # flip its own PR from draft to ready. This does that decision instead,
 # based only on things it can verify itself.
 #
+# Also keeps the Linear issue(s) a PR references in sync with the PR's
+# lifecycle, deterministically rather than relying on an agent to
+# remember: "In Progress" when the PR opens, "In Review" (plus a
+# specific assignee, if configured) when the PR is flipped ready. See
+# scripts/linear_issue_transition.py. This part is best-effort - a
+# Linear API hiccup never blocks the actual PR mechanics above.
+#
 # A project repo calls this with a small workflow of its own - see
 # .github/workflows-templates/ready-for-review-caller.yml in this repo for
 # the exact file to copy in.
@@ -21,6 +28,21 @@ on:
           markPullRequestReadyForReview mutation ("Resource not accessible
           by integration") - confirmed by hitting that error directly while
           building this, not a theoretical concern.
+      LINEAR_API_KEY:
+        required: false
+        description: >
+          A Linear Personal API key, scoped to the workspace this repo's
+          issues live in. Optional - if unset, the Linear-sync steps are
+          skipped entirely and only the GitHub-side ready-for-review
+          mechanics run.
+    inputs:
+      linear_reviewer_id:
+        type: string
+        required: false
+        description: >
+          Linear user ID to assign an issue to when its PR flips to ready
+          for review. Optional - if unset, the issue's assignee is left
+          untouched.
 
 permissions:
   pull-requests: write
@@ -28,6 +50,38 @@ permissions:
   contents: read
 
 jobs:
+  sync-linear-on-open:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'opened'
+    steps:
+      - name: Checkout (for the transition script)
+        uses: actions/checkout@v4
+        with:
+          repository: alexbmontiel/ready-for-review-workflow
+          sparse-checkout: scripts
+      - name: Move referenced issue(s) to In Progress
+        if: secrets.LINEAR_API_KEY != ''
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          identifiers=$(python3 -c "
+          import os, re
+          body = os.environ.get('PR_BODY') or ''
+          pattern = r'(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*([A-Z][A-Z0-9]*-\d+)'
+          for m in dict.fromkeys(re.findall(pattern, body)):
+              print(m)
+          ")
+          if [ -z "$identifiers" ]; then
+            echo "No Linear issue reference found in PR body - nothing to sync."
+            exit 0
+          fi
+          args=()
+          while IFS= read -r id; do args+=(--identifier "$id"); done <<< "$identifiers"
+          python3 scripts/linear_issue_transition.py "${args[@]}" --to-state "In Progress" || \
+            echo "::warning::Linear sync (In Progress) failed - continuing, this never blocks the PR."
+
   check-and-flip:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +108,7 @@ jobs:
           fi
 
       - name: Evaluate and flip to ready if conditions are met
+        id: flip
         if: steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ secrets.READY_FOR_REVIEW_PAT }}
@@ -69,11 +124,13 @@ jobs:
 
           if [ "$is_draft" != "true" ]; then
             echo "Already ready for review - nothing to do."
+            echo "flipped=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if ! echo "$body" | grep -qF '<!-- independent-review: passed -->'; then
             echo "No independent-review marker yet - staying draft."
+            echo "flipped=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -90,12 +147,50 @@ jobs:
 
           if [ "$pending" -gt 0 ]; then
             echo "Checks still running - staying draft, will be re-evaluated when they finish."
+            echo "flipped=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$bad" -gt 0 ]; then
             echo "One or more checks did not pass - staying draft."
+            echo "flipped=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "Marker present, checks clean: marking ready for review."
           gh pr ready "$PR_NUMBER"
+          echo "body=$body" >> "$GITHUB_OUTPUT"
+          echo "flipped=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout (for the transition script)
+        if: steps.flip.outputs.flipped == 'true' && secrets.LINEAR_API_KEY != ''
+        uses: actions/checkout@v4
+        with:
+          repository: alexbmontiel/ready-for-review-workflow
+          sparse-checkout: scripts
+
+      - name: Move referenced issue(s) to In Review
+        if: steps.flip.outputs.flipped == 'true' && secrets.LINEAR_API_KEY != ''
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_BODY: ${{ steps.flip.outputs.body }}
+          REVIEWER_ID: ${{ inputs.linear_reviewer_id }}
+        run: |
+          set -euo pipefail
+          identifiers=$(python3 -c "
+          import os, re
+          body = os.environ.get('PR_BODY') or ''
+          pattern = r'(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*([A-Z][A-Z0-9]*-\d+)'
+          for m in dict.fromkeys(re.findall(pattern, body)):
+              print(m)
+          ")
+          if [ -z "$identifiers" ]; then
+            echo "No Linear issue reference found in PR body - nothing to sync."
+            exit 0
+          fi
+          args=()
+          while IFS= read -r id; do args+=(--identifier "$id"); done <<< "$identifiers"
+          if [ -n "${REVIEWER_ID:-}" ]; then
+            args+=(--assignee-id "$REVIEWER_ID")
+          fi
+          python3 scripts/linear_issue_transition.py "${args[@]}" --to-state "In Review" || \
+            echo "::warning::Linear sync (In Review) failed - continuing, the PR is still ready."
