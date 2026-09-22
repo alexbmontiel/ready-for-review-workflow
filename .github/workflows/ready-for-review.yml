@@ -192,7 +192,19 @@ jobs:
 
           echo "Marker present, checks clean: marking ready for review."
           gh pr ready "$PR_NUMBER"
-          echo "body=$body" >> "$GITHUB_OUTPUT"
+          # A plain `echo "body=$body"` breaks for any multi-line body -
+          # which is virtually every real PR - and $GITHUB_OUTPUT enforces
+          # its format strictly enough that the malformed line fails this
+          # whole step (silently skipping every step after it, since they
+          # default to only running on success). Confirmed directly: this
+          # broke the Linear In Review sync on every real test. Use the
+          # documented multi-line delimiter form instead.
+          delim="body_$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          {
+            echo "body<<$delim"
+            echo "$body"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
           echo "flipped=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout (for the transition script)
