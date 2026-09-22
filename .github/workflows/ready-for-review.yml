@@ -148,16 +148,42 @@ jobs:
           # before it has CI) legitimately have none. Exclude this job's
           # own check run - it's still in_progress while this script is
           # running, which would otherwise make it wait on itself forever.
-          check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
-            --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
-          bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
-          pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
+          #
+          # Poll for pending checks instead of exiting and relying on a
+          # later re-trigger: this used to depend on `check_suite:
+          # completed` to re-evaluate once other checks finished, but that
+          # never actually worked - GitHub does not fire check_suite events
+          # for suites created by GitHub Actions itself (anti-loop
+          # protection), and nearly every check here is a GitHub Actions
+          # workflow. Confirmed by hitting it directly: a PR whose marker
+          # landed while a check was still running stayed in draft forever,
+          # no event ever came to re-check it. Polling within this same job
+          # run is the only thing that's actually been verified to work.
+          poll_interval=20
+          max_wait=600
+          elapsed=0
+          while :; do
+            check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
+              --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
+            bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
+            pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
 
-          if [ "$pending" -gt 0 ]; then
-            echo "Checks still running - staying draft, will be re-evaluated when they finish."
-            echo "flipped=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            if [ "$bad" -gt 0 ]; then
+              break
+            fi
+            if [ "$pending" -eq 0 ]; then
+              break
+            fi
+            if [ "$elapsed" -ge "$max_wait" ]; then
+              echo "Checks still pending after ${max_wait}s - giving up for this run. Staying draft; a new commit or PR edit will re-evaluate."
+              echo "flipped=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Checks still running (${elapsed}s elapsed) - waiting ${poll_interval}s and re-checking..."
+            sleep "$poll_interval"
+            elapsed=$((elapsed + poll_interval))
+          done
+
           if [ "$bad" -gt 0 ]; then
             echo "One or more checks did not pass - staying draft."
             echo "flipped=false" >> "$GITHUB_OUTPUT"
