@@ -1,0 +1,101 @@
+name: Ready for review check
+# Reusable workflow, shared across project repos (lifestyle, homeassistant,
+# and this repo itself). See policies/review-and-handoff.md for the marker
+# convention this depends on, and DESIGN.md's "deterministic hook" section
+# for why this exists: an agent should never be the one deciding when to
+# flip its own PR from draft to ready. This does that decision instead,
+# based only on things it can verify itself.
+#
+# A project repo calls this with a small workflow of its own - see
+# .github/workflows-templates/ready-for-review-caller.yml in this repo for
+# the exact file to copy in.
+
+on:
+  workflow_call:
+    secrets:
+      READY_FOR_REVIEW_PAT:
+        required: true
+        description: >
+          A fine-grained PAT with Pull requests: Read and write on this repo.
+          Required because GITHUB_TOKEN is documented to be blocked from the
+          markPullRequestReadyForReview mutation ("Resource not accessible
+          by integration") - confirmed by hitting that error directly while
+          building this, not a theoretical concern.
+
+permissions:
+  pull-requests: write
+  checks: read
+  contents: read
+
+jobs:
+  check-and-flip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the PR number for this event
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.READY_FOR_REVIEW_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            number="${{ github.event.pull_request.number }}"
+          else
+            # check_suite: find the open PR(s) for this head SHA.
+            sha="${{ github.event.check_suite.head_sha }}"
+            number=$(gh api "repos/${{ github.repository }}/commits/$sha/pulls" \
+              --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+          if [ -z "${number:-}" ]; then
+            echo "No associated PR found for this event - nothing to do."
+            echo "number=" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Evaluate and flip to ready if conditions are met
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.READY_FOR_REVIEW_PAT }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          pr_json=$(gh pr view "$PR_NUMBER" --json isDraft,body,headRefOid)
+          is_draft=$(echo "$pr_json" | jq -r '.isDraft')
+          body=$(echo "$pr_json" | jq -r '.body')
+          sha=$(echo "$pr_json" | jq -r '.headRefOid')
+
+          if [ "$is_draft" != "true" ]; then
+            echo "Already ready for review - nothing to do."
+            exit 0
+          fi
+
+          if ! echo "$body" | grep -qF '<!-- independent-review: passed -->'; then
+            echo "No independent-review marker yet - staying draft."
+            exit 0
+          fi
+
+          # If this commit has check runs, every one of them must have
+          # concluded successfully (or neutral/skipped). No check runs at
+          # all is not a failure - plenty of PRs (docs-only, this repo
+          # before it has CI) legitimately have none. Exclude this job's
+          # own check run - it's still in_progress while this script is
+          # running, which would otherwise make it wait on itself forever.
+          check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
+            --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
+          bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
+          pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
+
+          if [ "$pending" -gt 0 ]; then
+            echo "Checks still running - staying draft, will be re-evaluated when they finish."
+            exit 0
+          fi
+          if [ "$bad" -gt 0 ]; then
+            echo "One or more checks did not pass - staying draft."
+            exit 0
+          fi
+
+          echo "Marker present, checks clean: marking ready for review."
+          gh pr ready "$PR_NUMBER"
