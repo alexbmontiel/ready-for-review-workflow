@@ -49,6 +49,26 @@ permissions:
   checks: read
   contents: read
 
+# Root-caused a real bug this fixes (2026-09-25, `homeassistant` PR #31):
+# without this, a burst of `pull_request` events on the same PR (each
+# push, each PR-body edit - and review.yml's own marker-add step is
+# itself a PR-body edit, so a normal review pass alone produces at least
+# one) spawns overlapping check-and-flip runs for the same PR with no
+# ordering guarantee between them. One of those overlapping runs read
+# GitHub's check-runs API for the PR's head SHA and saw a `bad` (failed/
+# cancelled) conclusion that didn't reflect the PR's actual, real state -
+# most likely a stale or transiently-inconsistent read caused by two
+# check-and-flip evaluations racing each other, not a genuine check
+# failure (every check had already concluded successfully moments later
+# when queried again). The PR stayed in draft with everything actually
+# green until manually nudged. Same fix `deploy-dev.yml` and `review.yml`
+# already use for their own overlapping-run problems: bound concurrency
+# to one in-flight run per PR, cancelling a stale evaluation outright
+# when a newer push or edit supersedes it rather than letting two race.
+concurrency:
+  group: ready-for-review-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   sync-linear-on-open:
     runs-on: ubuntu-latest
@@ -169,7 +189,25 @@ jobs:
             pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
 
             if [ "$bad" -gt 0 ]; then
-              break
+              # Confirm before trusting a "bad" reading, not just a
+              # "pending" one - a transient or stale API read and a
+              # genuine failure both show up as bad on a single query,
+              # but only a genuine failure is still bad a few seconds
+              # later. Root-caused this exact false-bad case directly
+              # (2026-09-25, PR #31): every check had already concluded
+              # successfully when queried again moments after this loop
+              # read one as failed - the concurrency group above should
+              # prevent the overlapping runs that most likely caused it,
+              # but this re-check costs one extra API call and closes
+              # the gap even if that wasn't the whole story.
+              sleep 5
+              check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
+                --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
+              bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
+              pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
+              if [ "$bad" -gt 0 ]; then
+                break
+              fi
             fi
             if [ "$pending" -eq 0 ]; then
               break
