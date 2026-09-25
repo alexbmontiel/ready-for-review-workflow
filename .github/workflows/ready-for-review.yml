@@ -189,6 +189,12 @@ jobs:
             pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
 
             if [ "$bad" -gt 0 ]; then
+              # Log exactly which check(s) triggered this, every time -
+              # this class of bug has already recurred once even after a
+              # fix aimed at its most likely cause (the concurrency group
+              # above), so don't rely on theory the next time either;
+              # make the actual evidence show up in this run's own log.
+              echo "$check_runs" | jq -r '.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not) | "  BAD: \(.name) status=\(.status) conclusion=\(.conclusion) started_at=\(.started_at) completed_at=\(.completed_at)"'
               # Confirm before trusting a "bad" reading, not just a
               # "pending" one - a transient or stale API read and a
               # genuine failure both show up as bad on a single query,
@@ -196,16 +202,19 @@ jobs:
               # later. Root-caused this exact false-bad case directly
               # (2026-09-25, PR #31): every check had already concluded
               # successfully when queried again moments after this loop
-              # read one as failed - the concurrency group above should
-              # prevent the overlapping runs that most likely caused it,
-              # but this re-check costs one extra API call and closes
-              # the gap even if that wasn't the whole story.
+              # read one as failed. Recurred once even with the
+              # concurrency group above in place and no overlapping run
+              # in sight (2026-09-25, PR #32) - so that group was a real
+              # fix for its own cause, not the whole story here; this
+              # re-check (and the logging above) stay in either way.
               sleep 5
               check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
                 --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
               bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
               pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
               if [ "$bad" -gt 0 ]; then
+                echo "Still bad after the re-check - logging again before giving up:"
+                echo "$check_runs" | jq -r '.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not) | "  BAD: \(.name) status=\(.status) conclusion=\(.conclusion) started_at=\(.started_at) completed_at=\(.completed_at)"'
                 break
               fi
             fi
