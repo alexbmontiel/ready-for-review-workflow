@@ -179,13 +179,27 @@ jobs:
           # landed while a check was still running stayed in draft forever,
           # no event ever came to re-check it. Polling within this same job
           # run is the only thing that's actually been verified to work.
+          #
+          # "Bad" means a check that has COMPLETED without success/neutral/
+          # skipped. A check that is still queued or in_progress is
+          # "pending", not bad - the poll loop below waits on those. The
+          # original filter (`.conclusion != null and (...) | not`) parsed
+          # as `(.conclusion != null and (...)) | not`, which is true for
+          # any check whose conclusion is still null, so every pending
+          # check was counted as bad, failed the re-check 5s later, and
+          # made this run give up - a slow check like homeassistant's
+          # `deploy` finishing after the review marker landed left the PR
+          # in draft with everything green. This, not a transient API
+          # read, was the cause of the "false bad" recurrences on PRs
+          # #31, #32 and #34: the diagnostic logging added for them
+          # printed `BAD: deploy status=in_progress conclusion=null`.
           poll_interval=20
           max_wait=600
           elapsed=0
           while :; do
             check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
               --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
-            bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
+            bad=$(echo "$check_runs" | jq '[.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not))] | length')
             pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
 
             if [ "$bad" -gt 0 ]; then
@@ -194,7 +208,7 @@ jobs:
               # fix aimed at its most likely cause (the concurrency group
               # above), so don't rely on theory the next time either;
               # make the actual evidence show up in this run's own log.
-              echo "$check_runs" | jq -r '.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not) | "  BAD: \(.name) status=\(.status) conclusion=\(.conclusion) started_at=\(.started_at) completed_at=\(.completed_at)"'
+              echo "$check_runs" | jq -r '.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)) | "  BAD: \(.name) status=\(.status) conclusion=\(.conclusion) started_at=\(.started_at) completed_at=\(.completed_at)"'
               # Confirm before trusting a "bad" reading, not just a
               # "pending" one - a transient or stale API read and a
               # genuine failure both show up as bad on a single query,
@@ -210,11 +224,11 @@ jobs:
               sleep 5
               check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
                 --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
-              bad=$(echo "$check_runs" | jq '[.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)] | length')
+              bad=$(echo "$check_runs" | jq '[.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not))] | length')
               pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
               if [ "$bad" -gt 0 ]; then
                 echo "Still bad after the re-check - logging again before giving up:"
-                echo "$check_runs" | jq -r '.[] | select(.conclusion != null and (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not) | "  BAD: \(.name) status=\(.status) conclusion=\(.conclusion) started_at=\(.started_at) completed_at=\(.completed_at)"'
+                echo "$check_runs" | jq -r '.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)) | "  BAD: \(.name) status=\(.status) conclusion=\(.conclusion) started_at=\(.started_at) completed_at=\(.completed_at)"'
                 break
               fi
             fi
