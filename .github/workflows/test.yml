@@ -1,0 +1,26 @@
+name: Test
+# Unit tests for the reusable review and fix workflows, plus actionlint.
+# GitHub-hosted runners only: this repository is public, and a self-hosted
+# runner here would let anyone's fork run code on it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Workflow tests
+        run: python3 -m unittest discover -s tests -v
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color

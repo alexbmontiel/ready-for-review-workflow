@@ -1,0 +1,351 @@
+name: Independent review
+# Reusable workflow. Each repository calls it from a short
+# .github/workflows/review.yml, rendered by alex-mf-montiel/agentic-workflow's
+# scripts/onboard_review.py from that repository's entry in review/repos.json:
+# its HP runner label, notes for the reviewer, and extra commands the Claude
+# fallback may run. Review behavior changes here, once, for every repository.
+# This repository is public so repositories on both GitHub accounts can call
+# it; nothing sensitive lives here.
+#
+# Reviews every PR as a CI job on the calling repository's own HP self-hosted
+# runner, never as a local subprocess in an interactive coding session - see
+# agentic-workflow's policies/review-and-handoff.md for why that matters.
+# Codex reviews first; the Claude fallback runs when Codex gives no usable
+# review. Both answer in a fixed JSON shape their CLIs enforce, and the
+# verdict comes from that alone, never from their prose: pass when the
+# reviewer read the diff and lists no findings. The marker that lets the
+# ready-for-review Action flip the PR is added only on a pass, and the job
+# fails otherwise.
+#
+# Each runner is registered by homeassistant's infrastructure/hp-k3s
+# playbooks (register-github-runner.yml -e review_runner=<runner key>). Only
+# the repository owner and their own delegated agents push to a calling
+# repository, which is what makes a self-hosted runner acceptable there
+# (onboard_review.py refuses otherwise); this public repository has no
+# self-hosted runner of its own. Both reviewers run inside review-sandbox
+# (HOM-164, installed by homeassistant's review-sandbox.yml): each sees the
+# PR checkout read-only, one output directory and its own model login, and
+# not the other tool's login, any runner's registration files or work
+# directories, other processes, or the job's environment.
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: The calling repository's HP review runner label, e.g. homeassistant-review-hp.
+        type: string
+        required: true
+      notes:
+        description: Extra sentences for the reviewer about this repository.
+        type: string
+        default: ""
+      extra_allow:
+        description: Comma-separated extra Claude Code tool rules for the fallback, e.g. read-only checks.
+        type: string
+        default: ""
+    secrets:
+      READY_FOR_REVIEW_PAT:
+        description: Classic PAT with repo scope; adds the review marker so ready-for-review runs.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: [self-hosted, Linux, X64, "${{ inputs.runner_label }}"]
+    # A single healthy run takes 1-2 minutes. The ceiling is 25 because the
+    # Claude fallback can now make up to three attempts after a failed Codex
+    # one, each a few minutes; it is enforced by GitHub Actions killing the
+    # job outright, not by a local wall-clock timer that could fail to fire
+    # (see the header comment above).
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not the default shallow single-ref clone - the
+          # review needs the PR base branch's history actually present
+          # locally to diff against it.
+          fetch-depth: 0
+          # Don't leave the job token in .git/config: both reviewers can read
+          # the checkout (review-sandbox shows it read-only), so a diff could
+          # steer one into reading and quoting that token. Nothing after
+          # checkout needs git auth - the history is
+          # already fetched and gh uses GH_TOKEN. Found by this workflow's
+          # own first review (rayn PR #2, 2026-10-16).
+          persist-credentials: false
+
+      - name: Clear any stale independent-review marker
+        # Runs before the review itself, unconditionally, so a marker
+        # from an earlier, cleaner commit can never survive into a later
+        # commit that introduces real problems - confirmed bug from the
+        # first real run of this workflow (homeassistant PR #30).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_body="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}" \
+            --jq .body)"
+          if [[ "$current_body" == *"<!-- independent-review: passed -->"* ]]; then
+            # Remove every occurrence of the literal marker wherever it sits
+            # (CRLF line endings, trailing spaces, inline text). The
+            # ready-for-review gate counts the marker anywhere in the body
+            # (grep -F), so deleting only an exact marker line could leave a
+            # stale pass behind (flagged by agentic-workflow PR #8's review).
+            updated_body="$(printf '%s\n' "$current_body" | sed 's/<!-- independent-review: passed -->//g')"
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}" \
+              --raw-field body="$updated_body" > /dev/null
+          fi
+
+      - name: Run independent review (Codex, falling back to Claude)
+        id: review
+        # No GH_TOKEN in this step, on purpose: nothing here calls gh, and both
+        # reviewers read untrusted-in-principle diff text. review-sandbox
+        # already starts each reviewer with an empty environment and its own
+        # PID namespace, so neither this shell's variables nor any other
+        # process's /proc/<pid>/environ reach it; keeping the token out of the
+        # step is a second guard. The steps that do call gh set their own
+        # GH_TOKEN. The caller's notes and extra rules arrive as environment
+        # variables, never pasted into this script's text.
+        env:
+          REPO_NOTES: ${{ inputs.notes }}
+          EXTRA_ALLOW: ${{ inputs.extra_allow }}
+        run: |
+          set -euo pipefail
+          # Diff against the PR's own base branch, not a hard-coded main:
+          # onboarded repositories may default to another branch.
+          : "${GITHUB_BASE_REF:?this workflow only reviews pull_request events}"
+
+          PROMPT="Review the diff between the 'origin/${GITHUB_BASE_REF}' branch and this PR's HEAD (run \`git diff origin/${GITHUB_BASE_REF}...HEAD\` yourself first to see it).
+
+          Review only the actual diff and the files it changes. If you need to understand how the diff uses something outside the diff (a dependency, or a large data, generated, vendored, minified or gitignored file), judge that from how the diff references or calls it - do not read through such files themselves just to double-check their internals; doing so has exhausted a review's context window before. If you genuinely can't assess something without reading such a file, say so as a noted assumption instead. Do not run the application, its tests, or any script from this repository unless this prompt names it.${REPO_NOTES:+ $REPO_NOTES}
+
+          You are the independent reviewer, not the author - you have no memory of why this diff was written the way it was, which is the point. Judge it on what it actually does, not on assumed intent.
+
+          Answer in the JSON shape you are given. Put every material defect in \`findings\`, most severe first: the file, the line if there is one, a one-sentence summary, and a concrete failure scenario. Leave out style preferences and anything you aren't confident is a defect: any finding at all fails the review, and an empty \`findings\` list passes it. Use \`summary\` for a few sentences on what you checked (at least ten words). Set \`diff_inspected\` to true only if you ran the git diff and read the changes; if you couldn't, set it to false."
+
+          # The verdict is never read from a reviewer's prose. Both reviewers
+          # answer in this JSON shape, which their CLIs enforce (Codex
+          # --output-schema, Claude --json-schema), and judge() checks it again.
+          # Earlier versions classified Codex's free text with regexes, because
+          # `codex exec review` ignores --output-schema; 41 of about 105 reviews
+          # on recent PRs fell back to Claude when a clean answer missed the
+          # patterns (homeassistant #130: "No actionable defect is evident").
+          # So Codex now runs as `codex exec`, with this repository's review
+          # prompt, instead of its built-in review command.
+          command -v review-sandbox > /dev/null || {
+            echo "review-sandbox isn't installed on this runner; run homeassistant's infrastructure/hp-k3s/review-sandbox.yml" >&2
+            exit 1
+          }
+          REVIEW_OUT="$RUNNER_TEMP/review-out"
+          mkdir -p "$REVIEW_OUT"
+          rm -f "$REVIEW_OUT/codex.json" review_display.md
+          SCHEMA_JSON="$(cat <<'EOF'
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["diff_inspected", "summary", "findings"],
+            "properties": {
+              "diff_inspected": {"type": "boolean"},
+              "summary": {"type": "string"},
+              "findings": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["priority", "file", "line", "summary", "failure_scenario"],
+                  "properties": {
+                    "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                    "file": {"type": "string"},
+                    "line": {"type": ["integer", "null"]},
+                    "summary": {"type": "string"},
+                    "failure_scenario": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+          EOF
+          )"
+          # Codex reads it from the output directory, the one place outside the
+          # checkout that review-sandbox shows a reviewer. Claude gets it from
+          # this variable, not that file, since Codex can write there.
+          SCHEMA="$REVIEW_OUT/review-schema.json"
+          printf '%s\n' "$SCHEMA_JSON" > "$SCHEMA"
+          # judge FILE: the verdict, from the reviewer's JSON answer alone.
+          # Prints pass when it read the diff and lists no findings, and
+          # needs_changes when it lists any, and writes review_display.md from
+          # the same JSON. Prints nothing - an unusable answer - when the file
+          # is missing, isn't JSON of exactly this shape, says the diff wasn't
+          # read, or has a summary under ten words: a Claude answer whose
+          # whole summary was "test" passed homeassistant #131's review once.
+          judge() {
+            python3 - "$1" <<'PY' || true
+          import json, sys
+
+          FINDING_KEYS = {"priority", "file", "line", "summary", "failure_scenario"}
+
+          def text(value):
+              return isinstance(value, str) and value.strip() != ""
+
+          def described(value):
+              return text(value) and len(value.split()) >= 10
+
+          def valid_finding(f):
+              return (isinstance(f, dict) and set(f) == FINDING_KEYS
+                      and f["priority"] in ("P0", "P1", "P2", "P3")
+                      and text(f["file"]) and text(f["summary"]) and text(f["failure_scenario"])
+                      and (f["line"] is None or (type(f["line"]) is int and f["line"] > 0)))
+
+          try:
+              with open(sys.argv[1]) as fh:
+                  answer = json.load(fh)
+          except (OSError, ValueError):
+              sys.exit(0)
+          if not (isinstance(answer, dict) and set(answer) == {"diff_inspected", "summary", "findings"}
+                  and answer["diff_inspected"] is True and described(answer["summary"])
+                  and isinstance(answer["findings"], list)
+                  and all(valid_finding(f) for f in answer["findings"])):
+              sys.exit(0)
+          lines = [answer["summary"].strip(), ""]
+          if answer["findings"]:
+              lines += ["**Findings**", ""]
+              for f in answer["findings"]:
+                  where = f["file"] if f["line"] is None else f'{f["file"]}:{f["line"]}'
+                  lines.append(f'- **[{f["priority"]}]** `{where}`: {f["summary"].strip()}')
+                  lines.append(f'  - Failure scenario: {f["failure_scenario"].strip()}')
+          else:
+              lines.append("No findings.")
+          with open("review_display.md", "w") as fh:
+              fh.write("\n".join(lines) + "\n")
+          print("needs_changes" if answer["findings"] else "pass")
+          PY
+          }
+
+          echo "Attempting Codex review..."
+          # Each reviewer runs inside review-sandbox (see the header). It
+          # can't write the checkout, so Codex's answer goes to the output
+          # directory. Codex runs its own commands under its Landlock/seccomp
+          # sandbox (features.use_legacy_landlock): its default bwrap sandbox
+          # can't start inside review-sandbox on Ubuntu, and Landlock keeps
+          # those commands off the network.
+          # The model is pinned: without -m Codex uses its account default
+          # (gpt-6-astra on 2026-10-21), which drew down the owner's usage
+          # far faster than gpt-5.6-sol.
+          codex_verdict=""
+          if review-sandbox codex "$GITHUB_WORKSPACE" "$REVIEW_OUT" -- \
+              codex exec -m gpt-5.6-sol -c features.use_legacy_landlock=true -c sandbox_mode=read-only \
+              -c model_reasoning_effort=medium --output-schema "$SCHEMA" -o "$REVIEW_OUT/codex.json" "$PROMPT" \
+              > codex_output.txt 2>&1 < /dev/null; then
+            codex_verdict="$(judge "$REVIEW_OUT/codex.json")"
+            codex_problem="its answer didn't match the review schema or said it couldn't read the diff"
+          else
+            codex_problem="it exited with status $?"
+          fi
+          if [ -n "$codex_verdict" ]; then
+            echo "reviewer=codex" >> "$GITHUB_OUTPUT"
+            echo "verdict=$codex_verdict" >> "$GITHUB_OUTPUT"
+          else
+            echo "Codex gave no usable review ($codex_problem) - falling back to Claude" >&2
+            if [ -f "$REVIEW_OUT/codex.json" ]; then cat "$REVIEW_OUT/codex.json" >&2; fi
+            cat codex_output.txt >&2
+            # dontAsk denies every tool that is not explicitly allowed, so
+            # --allowedTools is required: without it the reviewer can't run
+            # `git diff`, the first thing the prompt asks for. Read-only git
+            # and file tools only; the disallow list stays as a second guard.
+            # In dontAsk mode a COMPOUND command is denied unless every part
+            # is on the allow list, and the model sometimes chains one (`git
+            # diff ...; echo ---; ls`, or a pipe into `head`), so the list also
+            # covers the harmless helpers it chains (echo, head, tail, wc,
+            # grep, ls, cd, pwd). Anything still denied is logged from the
+            # JSON's permission_denials.
+            # The allowed prefixes (echo, head, ...) match the literal command
+            # text, so they would also match `echo $GH_TOKEN`. The reviewer
+            # reads untrusted-in-principle diff text, so claude runs inside
+            # review-sandbox: empty environment, no other processes, and none
+            # of the runner's files except the checkout and its own login.
+            # Read/Grep/Glob are path-scoped to $GITHUB_WORKSPACE (the PR
+            # checkout): a bare `Read,Grep,Glob` could read any file the
+            # github-runner user can, including the model logins and the other
+            # review runner's checkout (both runners share uid 999).
+            # `/$GITHUB_WORKSPACE/**` renders the CLI's `//`-absolute anchor.
+            CLAUDE_ALLOW="Read(/$GITHUB_WORKSPACE/**),Grep(/$GITHUB_WORKSPACE/**),Glob(/$GITHUB_WORKSPACE/**),Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git status*),Bash(git ls-files*),Bash(git blame*),Bash(echo*),Bash(head*),Bash(tail*),Bash(wc*),Bash(grep*),Bash(ls*),Bash(cd*),Bash(pwd*)${EXTRA_ALLOW:+,$EXTRA_ALLOW}"
+            claude_verdict=""
+            for attempt in 1 2 3; do
+              review-sandbox claude "$GITHUB_WORKSPACE" "$REVIEW_OUT" -- claude -p "$PROMPT" --effort medium --allowedTools "$CLAUDE_ALLOW" --disallowedTools "Edit,Write,NotebookEdit,Bash(git commit*),Bash(git push*),Bash(git add*),Bash(rm*),Bash(mv*)" --permission-mode dontAsk --no-session-persistence --output-format json --json-schema "$SCHEMA_JSON" > review_raw.json 2> review_err.txt </dev/null || true
+              # The schema-checked answer is the result's structured_output.
+              python3 - > claude.json <<'PY' || true
+          import json, sys
+          try:
+              with open("review_raw.json") as fh:
+                  result = json.load(fh)
+          except (OSError, ValueError):
+              result = {}
+          denials = result.get("permission_denials") or []
+          if denials:
+              print("Claude fallback permission denials: " + json.dumps(denials)[:2000], file=sys.stderr)
+          if "structured_output" in result:
+              json.dump(result["structured_output"], sys.stdout)
+          PY
+              claude_verdict="$(judge claude.json)"
+              [ -n "$claude_verdict" ] && break
+              echo "Claude fallback attempt $attempt gave no usable review" >&2
+              cat review_raw.json >&2
+              # stderr too: an expired login or a rejected option fails before any
+              # JSON exists, and this is the only place that error would show.
+              cat review_err.txt >&2
+              if [ "$attempt" -lt 3 ]; then echo "retrying" >&2; fi
+            done
+            if [ -n "$claude_verdict" ]; then
+              echo "reviewer=claude (Codex gave no usable review: $codex_problem)" >> "$GITHUB_OUTPUT"
+              echo "verdict=$claude_verdict" >> "$GITHUB_OUTPUT"
+            else
+              echo "reviewer=none (neither Codex nor Claude gave a usable review)" >> "$GITHUB_OUTPUT"
+              echo "verdict=needs_changes" >> "$GITHUB_OUTPUT"
+              printf '%s\n' "Neither reviewer gave a usable review: Codex $codex_problem, and Claude's three attempts didn't match the review schema. The job log has both reviewers' output." > review_display.md
+            fi
+          fi
+
+          cat review_display.md
+
+      - name: Post review as a PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "**Independent review** (${{ steps.review.outputs.reviewer }}) - verdict: ${{ steps.review.outputs.verdict }}"
+            echo
+            cat review_display.md
+          } | gh pr comment "${{ github.event.pull_request.number }}" --body-file -
+
+      - name: Add the independent-review marker if the review passed
+        if: steps.review.outputs.verdict == 'pass'
+        env:
+          GH_TOKEN: ${{ secrets.READY_FOR_REVIEW_PAT }}
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          # Read through the REST API with this job's short-lived token. Unlike
+          # `gh pr view`, this does not invoke a GraphQL query that requires
+          # broad `read:org` access. Write through REST with the repository's
+          # READY_FOR_REVIEW_PAT, a classic PAT with `repo` scope (see
+          # onboard_review.py's secret step; fix.yml pushes with it too). A PAT-authored
+          # edit triggers the follow-up `pull_request: edited` workflow; the
+          # default GITHUB_TOKEN is deliberately prevented from doing so.
+          current_body="$(GH_TOKEN="$READ_TOKEN" gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}" \
+            --jq .body)"
+          updated_body="$(printf '%s\n\n<!-- independent-review: passed -->\n' "$current_body")"
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}" \
+            --raw-field body="$updated_body" > /dev/null
+
+      - name: Fail the check on anything other than a clean verdict
+        # Belt-and-suspenders alongside the marker-clearing step above:
+        # even if the marker logic ever had a gap, a non-pass verdict
+        # also fails this job outright, so ready-for-review's "every
+        # check on the head commit concluded successfully" condition
+        # independently blocks the flip too. Confirmed bug this fixes:
+        # the job previously always exited 0 regardless of verdict.
+        if: steps.review.outputs.verdict != 'pass'
+        run: exit 1
