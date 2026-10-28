@@ -1,0 +1,344 @@
+name: Fix failing checks
+# Reusable workflow. Each repository calls it from a short
+# .github/workflows/fix.yml, rendered by alex-mf-montiel/agentic-workflow's
+# scripts/onboard_review.py, which triggers on every finished workflow
+# (workflow_run) and passes its HP runner label. Fix behavior changes here,
+# once, for every repository.
+#
+# Fixes a PR's failing checks without anyone having to notice them. A script
+# decides when to act, never a model: every time any workflow on a PR
+# finishes, the decide step looks at the PR's current head commit and starts
+# a fix only when
+#   - the PR is still a draft (once the ready-for-review Action flips it,
+#     every check has passed and the PR is the owner's to review, so
+#     follow-up stops there),
+#   - every check on that commit has finished,
+#   - at least one failed or timed out (a cancelled check is left alone),
+#   - this commit has no auto-fix comment yet, and
+#   - the PR has fewer than three auto-fix commits.
+# The last check to finish is the one that starts it, so the fixer sees every
+# failure at once.
+#
+# The fixer is Claude, inside review-sandbox on the calling repository's HP
+# runner - the same isolation as the reviewers (HOM-164) - so Claude fixes
+# and Codex reviews the fix. It edits a copy of the checkout in the
+# sandbox's one writable directory and never sees the push token or the
+# checkout's real .git. This job then commits that copy
+# with the checkout's own git data, refuses anything that touches
+# .github/workflows or contains a model login token, and pushes with
+# READY_FOR_REVIEW_PAT, so CI and the independent review run again on the
+# fix. Every attempt ends with a PR comment saying what happened.
+#
+# Known limits, on purpose:
+#   - The fixer can edit and create files but not delete or rename them.
+#     Every command that could (rm, mv, git) can also reach its own login,
+#     which review-sandbox mounts read-write so Claude can refresh it: rm
+#     could delete it, git could print it. A failure whose fix is a deletion
+#     ends with a "changed nothing" comment for a person.
+#   - Only check runs count, not legacy commit statuses: every check in the
+#     onboarded repositories is a GitHub Actions job.
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: The calling repository's HP review runner label, e.g. homeassistant-review-hp.
+        type: string
+        required: true
+    secrets:
+      READY_FOR_REVIEW_PAT:
+        description: Classic PAT with repo scope; pushes the fix so CI and review run again.
+        required: true
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  fix:
+    # The caller runs this for every finished workflow, its own included;
+    # only runs for a PR from the calling repository go on.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - name: Decide whether to fix
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          MAX_ATTEMPTS = 3
+
+          def api(path):
+              return json.loads(subprocess.run(["gh", "api", path], check=True,
+                                               capture_output=True, text=True).stdout)
+
+          def pages(path):
+              items, page = [], 1
+              while True:
+                  batch = api(f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+                  items += batch
+                  if len(batch) < 100:
+                      return items
+                  page += 1
+
+          def output(**values):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  for key, value in values.items():
+                      fh.write(f"{key}={value}\n")
+
+          def skip(reason):
+              print(reason)
+              output(fix="false")
+              raise SystemExit(0)
+
+          owner = repo.split("/")[0]
+          prs = api(f"repos/{repo}/pulls?state=open&head={owner}:{os.environ['HEAD_BRANCH']}")
+          if not prs:
+              skip(f"No open PR for {os.environ['HEAD_BRANCH']}.")
+          pr = prs[0]
+          number, sha = pr["number"], pr["head"]["sha"]
+          if not pr["draft"]:
+              skip(f"PR #{number} is ready for review, so it's the owner's now.")
+          checks, page = [], 1
+          while True:
+              batch = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}")
+              checks += batch["check_runs"]
+              if not batch["check_runs"] or len(checks) >= batch["total_count"]:
+                  break
+              page += 1
+          pending = [c["name"] for c in checks if c["status"] != "completed"]
+          if pending:
+              skip(f"Still running on {sha}: {', '.join(pending)}. The last one to finish starts this again.")
+          failed = [c for c in checks if c["conclusion"] in ("failure", "timed_out")]
+          if not failed:
+              skip(f"No failed checks on {sha}.")
+          marker = f"<!-- auto-fix: {sha} -->"
+          if any(marker in (c["body"] or "") for c in pages(f"repos/{repo}/issues/{number}/comments")):
+              skip(f"{sha} already had an auto-fix attempt.")
+          attempts = sum(
+              any(line.startswith("Auto-fix-attempt:") for line in c["commit"]["message"].splitlines())
+              for c in pages(f"repos/{repo}/pulls/{number}/commits"))
+          names = ", ".join(c["name"] for c in failed)
+          if attempts >= MAX_ATTEMPTS:
+              body = (f"**Auto-fix** stopped: {attempts} attempts haven't got the checks passing. "
+                      f"Still failing on {sha[:7]}: {names}. This needs a person.\n\n{marker}")
+              subprocess.run(["gh", "api", "--method", "POST", f"repos/{repo}/issues/{number}/comments",
+                              "-f", f"body={body}"], check=True, capture_output=True)
+              skip(body)
+          print(f"Fixing {names} on {sha} (attempt {attempts + 1} of {MAX_ATTEMPTS}).")
+          output(fix="true", number=number, sha=sha, branch=pr["head"]["ref"], base=pr["base"]["ref"],
+                 attempt=attempts + 1, names=names,
+                 failed=json.dumps([{"id": c["id"], "name": c["name"]} for c in failed]))
+          PY
+
+      - if: steps.decide.outputs.fix == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.decide.outputs.sha }}
+          # The fixer may want the PR's whole diff against its base branch.
+          fetch-depth: 0
+          # Nothing reads a token from .git/config: the push below passes its
+          # own, and the fixer's copy of the checkout must not hold one.
+          persist-credentials: false
+
+      - name: Fix (Claude)
+        id: fix
+        if: steps.decide.outputs.fix == 'true'
+        # No push token in this step: only the fixer runs here.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.decide.outputs.base }}
+          NAMES: ${{ steps.decide.outputs.names }}
+          FAILED: ${{ steps.decide.outputs.failed }}
+        run: |
+          set -euo pipefail
+          command -v review-sandbox > /dev/null || {
+            echo "review-sandbox isn't installed on this runner; run homeassistant's infrastructure/hp-k3s/review-sandbox.yml" >&2
+            exit 1
+          }
+          # Everything this job writes stays out of the checkout, so none of it
+          # can end up in the fix commit.
+          FIX_OUT="$RUNNER_TEMP/fix-out"
+          WORK="$FIX_OUT/work"
+          rm -rf "$FIX_OUT"
+          mkdir -p "$FIX_OUT"
+
+          # The end of each failed check's log. For a GitHub Actions job the
+          # check run id is the job id; any other check gives its own summary.
+          # The independent review's job log ends with its findings.
+          jq -r '.[] | "\(.id) \(.name)"' <<< "$FAILED" | while read -r id name; do
+            echo "## $name"
+            echo
+            if ! gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" 2> /dev/null \
+                | sed -E 's/^[0-9-]+T[0-9:.]+Z //' | tail -n 150; then
+              gh api "repos/$GITHUB_REPOSITORY/check-runs/$id" \
+                | jq -r '.output | "\(.title // "")\n\(.summary // "")\n\(.text // "")"' \
+                || echo "(no log available)"
+            fi
+            echo
+          done > "$FIX_OUT/failures.txt"
+          # The fixer runs no commands (see below), so it gets the PR's own
+          # change here. One argument can't exceed 128 KB on Linux; together
+          # these keep the prompt well under it.
+          FAILURES="$(tail -c 50000 "$FIX_OUT/failures.txt")"
+          git diff "origin/$BASE...HEAD" > "$FIX_OUT/pr.diff" || echo "(the diff couldn't be computed)" > "$FIX_OUT/pr.diff"
+          PR_DIFF="$(head -c 50000 "$FIX_OUT/pr.diff")"
+          if [ "$(wc -c < "$FIX_OUT/pr.diff")" -gt 50000 ]; then PR_DIFF="$PR_DIFF
+          (diff truncated)"; fi
+
+          PROMPT="These checks failed on this pull request's head commit: $NAMES. The end of each one's log is below.
+
+          Make the smallest change to the files in this directory that makes them pass. The PR's own change is the diff at the end; keep to its intent and follow the repository's AGENTS.md or CLAUDE.md. Don't edit anything under .github/workflows and don't leave behind files the fix doesn't need. If no change to this repository can fix a failure (an expired login, a runner or network problem, a flaky test), leave it alone. End with two or three sentences on what you changed, or why you changed nothing.
+
+          $FAILURES
+
+          ## The PR's change (git diff origin/$BASE...HEAD)
+
+          $PR_DIFF"
+
+          # Claude edits a fresh copy of the checkout in review-sandbox's one
+          # writable directory. Not Codex: its write-mode command sandbox
+          # (0.154) panics with features.use_legacy_landlock, the only way it
+          # runs inside review-sandbox, and then reports success having changed
+          # nothing (tried on the HP, 2026-10-28).
+          # Tools: file tools inside the copy and nothing else - no shell
+          # commands at all. Even "read-only" ones can read any file (`git diff
+          # --no-index` prints Claude's own login, which is in the sandbox with
+          # it), and the repository's own scripts are code the fixer can edit
+          # first. Read is path-scoped for the same reason as in review.yml:
+          # both runners share one account and its logins. CI runs the real
+          # checks on the pushed fix.
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cp -a "$GITHUB_WORKSPACE/." "$WORK/"
+          # A second guard: everything of the fixer's that gets published - its
+          # summary (the commit message and PR comment) and its diff (next
+          # step) - is checked for a model login token first. This checker sits
+          # outside the sandbox's view, so the fixer can't change it. Exit
+          # status 1 means a token was found.
+          cat > "$RUNNER_TEMP/no_login_token.py" <<'PY'
+          import json, os, sys
+          text = sys.stdin.read()
+          def strings(value):
+              if isinstance(value, dict):
+                  for v in value.values():
+                      yield from strings(v)
+              elif isinstance(value, list):
+                  for v in value:
+                      yield from strings(v)
+              elif isinstance(value, str) and len(value) >= 20 and " " not in value:
+                  yield value
+          for path in ("~/.codex/auth.json", "~/.claude/.credentials.json"):
+              try:
+                  with open(os.path.expanduser(path)) as fh:
+                      login = json.load(fh)
+              except (OSError, ValueError):
+                  continue
+              if any(s in text for s in strings(login)):
+                  sys.exit(1)
+          PY
+          ALLOW="Read(/$WORK/**),Edit(/$WORK/**),Write(/$WORK/**),Grep(/$WORK/**),Glob(/$WORK/**)"
+          # review-sandbox starts in the checkout; the inner sh moves to the copy.
+          # shellcheck disable=SC2016
+          if review-sandbox claude "$GITHUB_WORKSPACE" "$FIX_OUT" -- \
+              sh -c 'cd "$1" && shift && exec "$@"' sh "$WORK" \
+              claude -p "$PROMPT" --effort medium --allowedTools "$ALLOW" --disallowedTools "Bash,NotebookEdit,WebFetch,WebSearch" \
+              --permission-mode dontAsk --no-session-persistence --output-format text \
+              > "$FIX_OUT/summary.txt" 2> "$RUNNER_TEMP/claude_err.txt" < /dev/null; then
+            echo "fixer=claude" >> "$GITHUB_OUTPUT"
+          else
+            echo "Claude failed (status $?)" >&2
+            cat "$RUNNER_TEMP/claude_err.txt" >&2
+            echo "fixer=" >> "$GITHUB_OUTPUT"
+          fi
+          if ! python3 "$RUNNER_TEMP/no_login_token.py" < "$FIX_OUT/summary.txt"; then
+            echo "(Claude's summary is withheld: it contained a model login token.)" > "$FIX_OUT/summary.txt"
+          fi
+
+      - name: Commit and push the fix
+        id: push
+        if: steps.fix.outputs.fixer != ''
+        env:
+          PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
+          BRANCH: ${{ steps.decide.outputs.branch }}
+          NAMES: ${{ steps.decide.outputs.names }}
+          ATTEMPT: ${{ steps.decide.outputs.attempt }}
+        run: |
+          set -euo pipefail
+          FIX_OUT="$RUNNER_TEMP/fix-out"
+          result() { echo "result=$1" >> "$GITHUB_OUTPUT"; echo "$1"; }
+          # Stage the fixer's copy against the checkout's own .git, which the
+          # fixer could only read: git ignores the copy's .git (its hooks and
+          # config never run), and the copy's files are only hashed.
+          git --work-tree="$FIX_OUT/work" add -A
+          changed="$(git diff --cached --name-only)"
+          if [ -z "$changed" ]; then
+            result "no change"
+            exit 0
+          fi
+          if grep -q '^\.github/workflows/' <<< "$changed"; then
+            result "not pushed: the change touched .github/workflows"
+            exit 0
+          fi
+          if ! git diff --cached | python3 "$RUNNER_TEMP/no_login_token.py"; then
+            result "not pushed: the change contained a model login token"
+            exit 0
+          fi
+          author="Claude <noreply@anthropic.com>"
+          {
+            echo "Fix failing checks: $NAMES"
+            echo
+            head -c 1500 "$FIX_OUT/summary.txt" 2> /dev/null || true
+            echo
+            echo
+            echo "Auto-fix-attempt: $ATTEMPT"
+          } > "$RUNNER_TEMP/fix-message.txt"
+          git -c user.name="${author% <*}" -c user.email="noreply@users.noreply.github.com" \
+            commit --no-verify -q --author="$author" -F "$RUNNER_TEMP/fix-message.txt"
+          # A plain fast-forward push: if the branch moved since this run
+          # started, it's refused and the next run looks again. The token
+          # reaches git through its environment (GIT_CONFIG_*), never as an
+          # argument: any process on the host can read another's arguments
+          # in /proc/<pid>/cmdline. printf is a shell builtin.
+          auth="$(printf 'x-access-token:%s' "$PAT" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git push -q origin "HEAD:refs/heads/$BRANCH"
+          result "pushed $(git rev-parse --short HEAD)"
+
+      - name: Report on the PR
+        id: report
+        # Also after a failure, so the comment marks this commit as tried and
+        # the next run doesn't try it again.
+        if: always() && steps.decide.outputs.fix == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.decide.outputs.number }}
+          SHA: ${{ steps.decide.outputs.sha }}
+          NAMES: ${{ steps.decide.outputs.names }}
+          ATTEMPT: ${{ steps.decide.outputs.attempt }}
+          FIXER: ${{ steps.fix.outputs.fixer }}
+          RESULT: ${{ steps.push.outputs.result }}
+        run: |
+          set -euo pipefail
+          summary="$(head -c 3000 "$RUNNER_TEMP/fix-out/summary.txt" 2> /dev/null || true)"
+          {
+            echo "**Auto-fix** attempt $ATTEMPT of 3 (${FIXER:-no fixer ran}) for: $NAMES"
+            echo
+            echo "Result: ${RESULT:-nothing pushed; the job log has the details}"
+            if [ -n "$summary" ]; then
+              echo
+              printf '%s\n' "$summary"
+            fi
+            echo
+            echo "<!-- auto-fix: $SHA -->"
+          } | gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -F body=@- > /dev/null

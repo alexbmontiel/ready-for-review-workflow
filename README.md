@@ -67,10 +67,11 @@ jobs:
       LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
 ```
 
-Requires a repo secret named `READY_FOR_REVIEW_PAT`: a fine-grained
-PAT with "Pull requests: Read and write" on that repo. `GITHUB_TOKEN` is
-documented to be blocked from the `markPullRequestReadyForReview`
-mutation, confirmed directly while building this — not theoretical.
+Requires a repo secret named `READY_FOR_REVIEW_PAT`: a **classic** PAT
+with `repo` scope. `GITHUB_TOKEN` is documented to be blocked from the
+`markPullRequestReadyForReview` mutation, and a fine-grained PAT is
+refused it too - both confirmed directly while building this. The review
+and fix workflows below use the same secret.
 Set it with:
 
 ```sh
@@ -89,3 +90,50 @@ ready-for-review mechanics.
 ```sh
 gh secret set LINEAR_API_KEY --repo <owner>/<repo>
 ```
+
+## Independent review and fixing failing checks
+
+Two more reusable workflows live here so every repository runs the same
+review and fix logic, changed in one place:
+
+- [`review.yml`](.github/workflows/review.yml) reviews each PR on the
+  calling repository's HP self-hosted runner, Codex first and Claude as the
+  fallback, and takes the verdict only from a schema-checked JSON answer. A
+  pass adds the `<!-- independent-review: passed -->` marker above.
+- [`fix.yml`](.github/workflows/fix.yml) fixes a draft PR whose checks
+  failed: a script decides when, Claude edits a sandboxed copy, and the job
+  commits and pushes, at most three times per PR.
+
+Don't hand-write the callers. `alex-mf-montiel/agentic-workflow`'s
+`scripts/onboard_review.py <owner/repo>` renders both from that
+repository's entry in `review/repos.json` (runner label, reviewer notes,
+extra allowed commands) and opens the PR. A caller looks like:
+
+```yaml
+name: Independent review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    uses: alexbmontiel/ready-for-review-workflow/.github/workflows/review.yml@main
+    with:
+      runner_label: <repo>-review-hp
+      notes: "<sentences for the reviewer, optional>"
+      extra_allow: "<comma-separated Claude Code rules, optional>"
+    secrets:
+      READY_FOR_REVIEW_PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
+```
+
+The callers reference `@main`, so a merge here reaches every repository
+on its next run. To try a change first, point one repository's caller at
+the branch in a draft PR there: that PR's own review runs the new version
+on its HP runner. This repository has no self-hosted runner of its own
+(it's public); `test.yml` runs the workflow tests on GitHub's runners.
+
