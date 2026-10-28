@@ -165,8 +165,14 @@ jobs:
           # If this commit has check runs, every one of them must have
           # concluded successfully (or neutral/skipped). No check runs at
           # all is not a failure - plenty of PRs (docs-only, this repo
-          # before it has CI) legitimately have none. Exclude this job's
-          # own check run - it's still in_progress while this script is
+          # before it has CI) legitimately have none. Exclude this workflow's
+          # own jobs: they gate nothing, and a newer event's run cancels an
+          # older one (the concurrency group above), so a cancelled
+          # sync-linear-on-open would otherwise read as a failed check and
+          # keep the PR in draft forever - seen on homeassistant #134, which
+          # Cyrus opened and edited a second later (2026-10-28). Any other
+          # cancelled check still blocks. This job's own check run is also
+          # still in_progress while this script is
           # running, which would otherwise make it wait on itself forever.
           #
           # Poll for pending checks instead of exiting and relying on a
@@ -198,7 +204,7 @@ jobs:
           elapsed=0
           while :; do
             check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
-              --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
+              --jq '[.check_runs[] | select((.name | endswith("check-and-flip") or endswith("sync-linear-on-open")) | not)]')
             bad=$(echo "$check_runs" | jq '[.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not))] | length')
             pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
 
@@ -223,7 +229,7 @@ jobs:
               # re-check (and the logging above) stay in either way.
               sleep 5
               check_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
-                --jq '[.check_runs[] | select(.name | endswith("check-and-flip") | not)]')
+                --jq '[.check_runs[] | select((.name | endswith("check-and-flip") or endswith("sync-linear-on-open")) | not)]')
               bad=$(echo "$check_runs" | jq '[.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not))] | length')
               pending=$(echo "$check_runs" | jq '[.[] | select(.status != "completed")] | length')
               if [ "$bad" -gt 0 ]; then
