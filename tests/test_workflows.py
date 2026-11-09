@@ -494,6 +494,17 @@ class FixCommit(unittest.TestCase):
         self.assertEqual(out["result"], "not pushed: the change contained a model login token")
         self.assertEqual(self.remote("rev-parse", "feature"), before)
 
+    def test_the_one_year_claude_token_is_never_pushed(self):
+        import json
+        token = "sk-ant-oat01-0123456789abcdefghij"
+        settings = self.tmp / "home" / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"env": {"CLAUDE_CODE_OAUTH_TOKEN": token}}))
+        before = self.remote("rev-parse", "feature")
+        out = self.run_steps(FAKE_FIX=self.FIX + f" && echo '{token}' > leaked.txt")
+        self.assertEqual(out["result"], "not pushed: the change contained a model login token")
+        self.assertEqual(self.remote("rev-parse", "feature"), before)
+
     def test_a_login_token_in_the_summary_is_never_published(self):
         out = self.run_steps(FAKE_FIX=self.FIX, FAKE_SUMMARY=f"Fixed it. Also: {self.TOKEN}")
         self.assertTrue(out["result"].startswith("pushed "), out)

@@ -237,12 +237,18 @@ jobs:
                       yield from strings(v)
               elif isinstance(value, str) and len(value) >= 20 and " " not in value:
                   yield value
-          for path in ("~/.codex/auth.json", "~/.claude/.credentials.json"):
+          # Claude's one-year token (claude setup-token) is in its settings,
+          # as env.CLAUDE_CODE_OAUTH_TOKEN; only that file's env is checked.
+          for path, part in (("~/.codex/auth.json", None),
+                             ("~/.claude/.credentials.json", None),
+                             ("~/.claude/settings.json", "env")):
               try:
                   with open(os.path.expanduser(path)) as fh:
                       login = json.load(fh)
               except (OSError, ValueError):
                   continue
+              if part:
+                  login = login.get(part) if isinstance(login, dict) else None
               if any(s in text for s in strings(login)):
                   sys.exit(1)
           PY
