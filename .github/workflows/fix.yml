@@ -77,8 +77,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        # Every python3 in this job runs with -I. On a self-hosted runner the
+        # working directory still holds an earlier job's checkout, and
+        # `python3 -` imports from it first: a PR's json.py would run here.
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json, os, subprocess
 
           repo = os.environ["GITHUB_REPOSITORY"]
@@ -288,7 +291,7 @@ jobs:
             cat "$RUNNER_TEMP/claude_err.txt" >&2
             echo "fixer=" >> "$GITHUB_OUTPUT"
           fi
-          if ! python3 "$RUNNER_TEMP/no_login_token.py" < "$FIX_OUT/summary.txt"; then
+          if ! python3 -I "$RUNNER_TEMP/no_login_token.py" < "$FIX_OUT/summary.txt"; then
             echo "(Claude's summary is withheld: it contained a model login token.)" > "$FIX_OUT/summary.txt"
           fi
 
@@ -317,7 +320,7 @@ jobs:
             result "not pushed: the change touched .github/workflows"
             exit 0
           fi
-          if ! git diff --cached | python3 "$RUNNER_TEMP/no_login_token.py"; then
+          if ! git diff --cached | python3 -I "$RUNNER_TEMP/no_login_token.py"; then
             result "not pushed: the change contained a model login token"
             exit 0
           fi
