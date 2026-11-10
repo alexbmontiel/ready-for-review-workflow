@@ -141,18 +141,19 @@ jobs:
       READY_FOR_REVIEW_PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
 ```
 
-With the cleanup, the caller has two jobs, each with its own concurrency
-group in place of the workflow's: the review waits for the cleanup and is
-skipped when the cleanup pushed, because the push starts a new run whose
-review covers the cleaned-up code. A newer push never cancels a cleanup
-halfway.
+With the cleanup, the caller has two jobs that share one concurrency group
+in place of the workflow's: the review waits for the cleanup and is skipped
+when the cleanup pushed, because the push starts a new run whose review
+covers the cleaned-up code. Sharing the group lets a newer push cancel an
+older review that is still running; the newer review, waiting on its
+cleanup, isn't in the group yet.
 
 ```yaml
 jobs:
   cleanup:
     concurrency:
-      group: cleanup-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
+      group: review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     uses: alexbmontiel/ready-for-review-workflow/.github/workflows/cleanup.yml@main
     with:
       runner_label: <repo>-review-hp

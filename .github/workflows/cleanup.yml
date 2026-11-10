@@ -37,11 +37,14 @@ name: Cleanup pass
 # cleanup problem never fails a check, because a failed check would block the
 # PR and start the fixer. The job log and the PR comment say what happened.
 #
-# The caller gives this job its own concurrency group, without
-# cancel-in-progress, so a newer push never cancels a cleanup halfway: the
-# newer run waits, then sees the finished cleanup and skips. A cleanup whose
-# push is refused because the branch moved leaves no marker, so the newer
-# commit's run tries again.
+# The caller puts this job and the review in one concurrency group, with
+# cancel-in-progress, so a newer push cancels whatever is left of an older
+# run, a cleanup partway through included. A cancelled cleanup has pushed
+# nothing and posted no marker, so the newer run's cleanup starts over. One
+# cancelled right after its push may lose its comment, but the commit's
+# Cleanup-pass trailer still marks the PR and carries the same summary. A
+# cleanup whose push is refused because the branch moved leaves no marker
+# either, so the newer commit's run tries again.
 on:
   workflow_call:
     inputs:
@@ -474,7 +477,9 @@ jobs:
         id: report
         # Once Claude has run, whatever happened, so the comment marks the PR
         # as cleaned up and no later run tries again - except when the push
-        # was refused, so the newer commit's run can.
+        # was refused, so the newer commit's run can. The push comes first;
+        # if the run it starts cancels this one before the comment is posted,
+        # the commit's Cleanup-pass trailer still marks the PR.
         if: ${{ !cancelled() && steps.cleanup.outcome != 'skipped' && steps.cleanup.outcome != '' }}
         continue-on-error: true
         env:
