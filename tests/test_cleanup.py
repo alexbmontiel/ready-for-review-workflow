@@ -6,6 +6,7 @@ need it are skipped when it can't be installed).
 Run: python3 -m unittest discover -s tests"""
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -110,8 +111,8 @@ _LIZARD = {}
 
 
 def lizard_venv():
-    """Runs cleanup.yml's own install step once, so the pins and hashes are
-    the ones tested. None when it can't install (no network, say)."""
+    """Runs cleanup.yml's own install step once, so the pinned URLs and
+    hashes are the ones tested. None when it can't (no network, say)."""
     if "venv" not in _LIZARD:
         temp = Path(tempfile.mkdtemp())
         env = {"PATH": BASE_PATH, "RUNNER_TEMP": str(temp), "HOME": str(temp)}
@@ -152,9 +153,15 @@ class CleanupGuards(unittest.TestCase):
 
     def test_code_that_reads_the_pr_runs_isolated(self):
         text = CLEANUP.read_text()
-        for line in text.splitlines():
-            if '"$VENV/bin/python"' in line:
-                self.assertIn('"$VENV/bin/python" -I', line)
+        # Every python3, including ones that only read this job's own files:
+        # a step's working directory is the PR's checkout, and `python3 -`
+        # imports from there first (a planted json.py, say).
+        calls = re.findall(r"python3 (?!-m venv)\S*", "\n".join(
+            line for line in text.splitlines() if not line.strip().startswith("#")))
+        self.assertGreaterEqual(len(calls), 8)
+        for call in calls:
+            self.assertEqual(call, "python3 -I", calls)
+        self.assertNotIn("pip install", text)
 
     def test_caller_inputs_reach_scripts_only_through_the_environment(self):
         for line in CLEANUP.read_text().splitlines():

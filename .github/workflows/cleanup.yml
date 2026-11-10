@@ -77,7 +77,7 @@ jobs:
           NUMBER: ${{ github.event.pull_request.number }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json, os, subprocess
 
           repo = os.environ["GITHUB_REPOSITORY"]
@@ -145,22 +145,29 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          # lizard and its two dependencies, pinned by hash. The virtualenv and
-          # the scripts that use it live outside the directory review-sandbox
-          # lets Claude write, so Claude can't change code that runs outside
-          # the sandbox. Every python that reads the PR's files runs with -I:
-          # isolated mode never imports from the current or script directory,
-          # where a PR or Claude could plant a lizard.py.
-          VENV="$RUNNER_TEMP/cleanup-lizard"
-          rm -rf "$VENV"
-          python3 -m venv "$VENV"
-          cat > "$RUNNER_TEMP/cleanup-requirements.txt" <<'EOF'
-          lizard==1.24.3 --hash=sha256:f7fccd909719170e323a240cc6927bfea65984d77a8f9c0e6405be582e9861db
-          pathspec==1.1.1 --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
-          pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+          # lizard and its two dependencies: pure-Python wheels, pinned by URL
+          # and hash, unpacked into a folder rather than installed with pip,
+          # which the HP doesn't have. That folder and the scripts that use it
+          # live outside the directory review-sandbox lets Claude write, so
+          # Claude can't change code that runs outside the sandbox. Every
+          # python that reads the PR's files runs with -I: isolated mode never
+          # imports from the current or script directory, where a PR or Claude
+          # could plant a lizard.py, and ignores PYTHONPATH. The scripts add
+          # this folder to their own path.
+          LIB="$RUNNER_TEMP/cleanup-lizard"
+          rm -rf "$LIB"
+          mkdir -p "$LIB/wheels"
+          while read -r url sha; do
+            wheel="$LIB/wheels/${url##*/}"
+            curl -fsSL --retry 3 -o "$wheel" "$url"
+            python3 -I -c 'import hashlib, sys; sys.exit(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() != sys.argv[2])' "$wheel" "$sha" \
+              || { echo "$wheel doesn't match its pinned hash" >&2; exit 1; }
+            python3 -I -m zipfile -e "$wheel" "$LIB/lib"
+          done <<'EOF'
+          https://files.pythonhosted.org/packages/10/4f/00874924fcc0544f8e294d2bf6a8550ee69f7501a0e2c54149443f763bd3/lizard-1.24.3-py2.py3-none-any.whl f7fccd909719170e323a240cc6927bfea65984d77a8f9c0e6405be582e9861db
+          https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+          https://files.pythonhosted.org/packages/71/46/17f022dd3e953bf20a04a028a21ec746d942f8d2af30fa0f124fa0e6a684/pygments-2.21.0-py3-none-any.whl 2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
           EOF
-          "$VENV/bin/pip" install --quiet --disable-pip-version-check --require-hashes --only-binary :all: \
-            --no-deps -r "$RUNNER_TEMP/cleanup-requirements.txt"
 
       - name: Pick the PR's code files
         id: select
@@ -170,7 +177,6 @@ jobs:
           BASE: ${{ steps.decide.outputs.base }}
         run: |
           set -euo pipefail
-          VENV="$RUNNER_TEMP/cleanup-lizard"
           OUT="$RUNNER_TEMP/cleanup-out"
           rm -rf "$OUT"
           mkdir -p "$OUT"
@@ -178,6 +184,7 @@ jobs:
           # measure ROOT FILES.json: lizard's numbers for those files under ROOT.
           cat > "$RUNNER_TEMP/cleanup_measure.py" <<'PY'
           import contextlib, io, json, os, re, sys
+          sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "cleanup-lizard", "lib"))
           import lizard
 
           def measure(root, files):
@@ -207,8 +214,9 @@ jobs:
                   print(json.dumps(measure(sys.argv[1], json.load(fh))))
           PY
 
-          "$VENV/bin/python" -I - "$OUT" <<'PY'
+          python3 -I - "$OUT" <<'PY'
           import json, os, re, subprocess, sys
+          sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "cleanup-lizard", "lib"))
           from lizard_languages import get_reader_for
 
           MIN_LINES = 40
@@ -365,7 +373,7 @@ jobs:
             cat "$RUNNER_TEMP/cleanup_err.txt" >&2
             echo "ran=false" >> "$GITHUB_OUTPUT"
           fi
-          if ! python3 "$RUNNER_TEMP/no_login_token.py" < "$OUT/summary.txt"; then
+          if ! python3 -I "$RUNNER_TEMP/no_login_token.py" < "$OUT/summary.txt"; then
             echo "(Claude's summary is withheld: it contained a model login token.)" > "$OUT/summary.txt"
           fi
 
@@ -376,7 +384,6 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/cleanup-out"
-          VENV="$RUNNER_TEMP/cleanup-lizard"
           result() { echo "result=$1" >> "$GITHUB_OUTPUT"; echo "$1"; }
           mapfile -t files < <(jq -r '.[]' "$OUT/files.json")
           # Stage only the PR's code files from Claude's copy, against the
@@ -386,14 +393,14 @@ jobs:
             result "no change"
             exit 0
           fi
-          if ! git diff --cached | python3 "$RUNNER_TEMP/no_login_token.py"; then
+          if ! git diff --cached | python3 -I "$RUNNER_TEMP/no_login_token.py"; then
             git reset -q
             result "not kept: the change contained a model login token"
             exit 0
           fi
-          "$VENV/bin/python" -I "$RUNNER_TEMP/cleanup_measure.py" "$GITHUB_WORKSPACE" "$OUT/files.json" > "$OUT/before.json"
-          "$VENV/bin/python" -I "$RUNNER_TEMP/cleanup_measure.py" "$OUT/work" "$OUT/files.json" > "$OUT/after.json"
-          python3 - "$OUT" <<'PY'
+          python3 -I "$RUNNER_TEMP/cleanup_measure.py" "$GITHUB_WORKSPACE" "$OUT/files.json" > "$OUT/before.json"
+          python3 -I "$RUNNER_TEMP/cleanup_measure.py" "$OUT/work" "$OUT/files.json" > "$OUT/after.json"
+          python3 -I - "$OUT" <<'PY'
           import json, os, sys
           out = sys.argv[1]
           with open(os.path.join(out, "before.json")) as fh:
