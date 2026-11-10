@@ -180,8 +180,11 @@ jobs:
           # is missing, isn't JSON of exactly this shape, says the diff wasn't
           # read, or has a summary under ten words: a Claude answer whose
           # whole summary was "test" passed homeassistant #131's review once.
+          # Every python3 here runs with -I: this step's working directory is
+          # the PR's checkout, and `python3 -` imports from there first, so a
+          # PR's own json.py would run on the runner, outside review-sandbox.
           judge() {
-            python3 - "$1" <<'PY' || true
+            python3 -I - "$1" <<'PY' || true
           import json, sys
 
           FINDING_KEYS = {"priority", "file", "line", "summary", "failure_scenario"}
@@ -275,7 +278,7 @@ jobs:
             for attempt in 1 2 3; do
               review-sandbox claude "$GITHUB_WORKSPACE" "$REVIEW_OUT" -- claude -p "$PROMPT" --effort medium --allowedTools "$CLAUDE_ALLOW" --disallowedTools "Edit,Write,NotebookEdit,Bash(git commit*),Bash(git push*),Bash(git add*),Bash(rm*),Bash(mv*)" --permission-mode dontAsk --no-session-persistence --output-format json --json-schema "$SCHEMA_JSON" > review_raw.json 2> review_err.txt </dev/null || true
               # The schema-checked answer is the result's structured_output.
-              python3 - > claude.json <<'PY' || true
+              python3 -I - > claude.json <<'PY' || true
           import json, sys
           try:
               with open("review_raw.json") as fh:

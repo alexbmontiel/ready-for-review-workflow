@@ -74,6 +74,18 @@ class Guards(unittest.TestCase):
         self.assertNotIn('git -c "http.https://github.com/.extraheader', text)
         self.assertIn('GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"', text)
 
+    def test_every_python_runs_isolated(self):
+        # A step's working directory is a PR's checkout (or, before checkout,
+        # an earlier job's), and `python3 -` imports from it first, so a PR
+        # could plant a json.py that runs on the runner, outside the sandbox.
+        for path in (REVIEW, FIX, WORKFLOWS / "cleanup.yml"):
+            code = "\n".join(line for line in path.read_text().splitlines()
+                             if not line.strip().startswith("#"))
+            calls = re.findall(r"python3 \S*", code)
+            self.assertTrue(calls, path.name)
+            for call in calls:
+                self.assertEqual(call, "python3 -I", f"{path.name}: {calls}")
+
     def test_caller_inputs_reach_scripts_only_through_the_environment(self):
         # A caller's notes or rules pasted into a script's text could break or
         # inject into it; they must arrive as environment variables.
@@ -172,6 +184,17 @@ class ReviewVerdict(unittest.TestCase):
         self.assertEqual(out, {"reviewer": "codex", "verdict": "pass"})
         self.assertEqual(calls, 0)
         self.assertIn("No findings.", display)
+
+    def test_a_json_py_in_the_checkout_never_runs(self):
+        # The review step runs in the PR's checkout; a planted json.py must
+        # not be imported by the verdict check or the Claude fallback's parser.
+        (self.tmp / "ws" / "json.py").write_text(
+            "open(__file__ + '.ran', 'w').write('x')\nfrom json_never import *\n")
+        for codex in (self.CLEAN, None):
+            with self.subTest(fallback=codex is None):
+                out, _, _ = self.review(codex=codex, claude=self.CLEAN)
+                self.assertEqual(out["verdict"], "pass")
+                self.assertFalse((self.tmp / "ws" / "json.py.ran").exists())
 
     def test_any_codex_finding_fails(self):
         out, calls, display = self.review(codex=self.FINDING)
