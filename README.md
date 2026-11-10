@@ -91,10 +91,10 @@ ready-for-review mechanics.
 gh secret set LINEAR_API_KEY --repo <owner>/<repo>
 ```
 
-## Independent review and fixing failing checks
+## Independent review, cleanup and fixing failing checks
 
-Two more reusable workflows live here so every repository runs the same
-review and fix logic, changed in one place:
+Three more reusable workflows live here so every repository runs the same
+review, cleanup and fix logic, changed in one place:
 
 - [`review.yml`](.github/workflows/review.yml) reviews each PR on the
   calling repository's HP self-hosted runner, Codex first and Claude as the
@@ -102,12 +102,22 @@ review and fix logic, changed in one place:
   pass adds the `<!-- independent-review: passed -->` marker above.
 - [`fix.yml`](.github/workflows/fix.yml) fixes a draft PR whose checks
   failed: a script decides when, Claude edits a sandboxed copy, and the job
-  commits and pushes, at most three times per PR.
+  commits and pushes, at most three times per PR. If the failing commit is
+  the cleanup pass's and it broke a check that passed before it, the job
+  reverts that commit instead.
+- [`cleanup.yml`](.github/workflows/cleanup.yml), for repositories that opt
+  in, simplifies a draft PR's code once, before the review sees it. Claude
+  (Opus) edits a sandboxed copy of the PR's own code files. A script keeps
+  the change only if lizard's numbers for those files (lines of code,
+  complexity, duplication) got better and none got worse, then commits,
+  pushes and comments. It never runs again on that PR, so the review and the
+  fixer keep the last word. PRs under 40 changed lines of code skip it.
 
 Don't hand-write the callers. `alex-mf-montiel/agentic-workflow`'s
 `scripts/onboard_review.py <owner/repo>` renders both from that
 repository's entry in `review/repos.json` (runner label, reviewer notes,
-extra allowed commands) and opens the PR. A caller looks like:
+extra allowed commands, whether the cleanup runs) and opens the PR. A caller
+without the cleanup looks like:
 
 ```yaml
 name: Independent review
@@ -130,6 +140,37 @@ jobs:
     secrets:
       READY_FOR_REVIEW_PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
 ```
+
+With the cleanup, the caller has two jobs that share one concurrency group
+in place of the workflow's: the review waits for the cleanup and is skipped
+when the cleanup pushed, because the push starts a new run whose review
+covers the cleaned-up code. Sharing the group lets a newer push cancel an
+older review that is still running; the newer review, waiting on its
+cleanup, isn't in the group yet.
+
+```yaml
+jobs:
+  cleanup:
+    concurrency:
+      group: review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: alexbmontiel/ready-for-review-workflow/.github/workflows/cleanup.yml@main
+    with:
+      runner_label: <repo>-review-hp
+    secrets:
+      READY_FOR_REVIEW_PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
+  review:
+    needs: cleanup
+    if: ${{ !cancelled() && needs.cleanup.outputs.pushed != 'true' }}
+    concurrency:
+      group: review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: alexbmontiel/ready-for-review-workflow/.github/workflows/review.yml@main
+    # with and secrets as above
+```
+
+Mark vendored or generated code with `linguist-vendored` or
+`linguist-generated` in `.gitattributes`, and the cleanup leaves it alone.
 
 The callers reference `@main`, so a merge here reaches every repository
 on its next run. To try a change first, point one repository's caller at
