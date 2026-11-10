@@ -19,6 +19,13 @@ name: Fix failing checks
 # The last check to finish is the one that starts it, so the fixer sees every
 # failure at once.
 #
+# One exception: when the head commit is the cleanup pass's (cleanup.yml, a
+# "Cleanup-pass: applied" trailer) and it broke one of the repository's own
+# checks that passed on the commit before it, this job reverts the cleanup
+# commit instead of fixing it. The cleanup is optional, so undoing it is the
+# safe fix. A failed review on that commit goes to the fixer as usual: it may
+# be about the PR's own code.
+#
 # The fixer is Claude, inside review-sandbox on the calling repository's HP
 # runner - the same isolation as the reviewers (HOM-164) - so Claude fixes
 # and Codex reviews the fix. It edits a copy of the checkout in the
@@ -76,6 +83,8 @@ jobs:
 
           repo = os.environ["GITHUB_REPOSITORY"]
           MAX_ATTEMPTS = 3
+          # Checks from these shared workflows, not the repository's own.
+          SHARED_CHECKS = ("review / ", "cleanup / ", "ready-for-review / ")
 
           def api(path):
               return json.loads(subprocess.run(["gh", "api", path], check=True,
@@ -108,13 +117,16 @@ jobs:
           number, sha = pr["number"], pr["head"]["sha"]
           if not pr["draft"]:
               skip(f"PR #{number} is ready for review, so it's the owner's now.")
-          checks, page = [], 1
-          while True:
-              batch = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}")
-              checks += batch["check_runs"]
-              if not batch["check_runs"] or len(checks) >= batch["total_count"]:
-                  break
-              page += 1
+          def check_runs(commit):
+              runs, page = [], 1
+              while True:
+                  batch = api(f"repos/{repo}/commits/{commit}/check-runs?per_page=100&page={page}")
+                  runs += batch["check_runs"]
+                  if not batch["check_runs"] or len(runs) >= batch["total_count"]:
+                      return runs
+                  page += 1
+
+          checks = check_runs(sha)
           pending = [c["name"] for c in checks if c["status"] != "completed"]
           if pending:
               skip(f"Still running on {sha}: {', '.join(pending)}. The last one to finish starts this again.")
@@ -124,6 +136,16 @@ jobs:
           marker = f"<!-- auto-fix: {sha} -->"
           if any(marker in (c["body"] or "") for c in pages(f"repos/{repo}/issues/{number}/comments")):
               skip(f"{sha} already had an auto-fix attempt.")
+          head = api(f"repos/{repo}/commits/{sha}")
+          if "Cleanup-pass: applied" in head["commit"]["message"].splitlines() and head["parents"]:
+              passed_before = {c["name"] for c in check_runs(head["parents"][0]["sha"])
+                               if c["conclusion"] == "success"}
+              broken = [c["name"] for c in failed
+                        if not c["name"].startswith(SHARED_CHECKS) and c["name"] in passed_before]
+              if broken:
+                  print(f"The cleanup commit {sha} broke {', '.join(broken)}; reverting it.")
+                  output(fix="revert", number=number, sha=sha, branch=pr["head"]["ref"], names=", ".join(broken))
+                  raise SystemExit(0)
           attempts = sum(
               any(line.startswith("Auto-fix-attempt:") for line in c["commit"]["message"].splitlines())
               for c in pages(f"repos/{repo}/pulls/{number}/commits"))
@@ -140,7 +162,7 @@ jobs:
                  failed=json.dumps([{"id": c["id"], "name": c["name"]} for c in failed]))
           PY
 
-      - if: steps.decide.outputs.fix == 'true'
+      - if: steps.decide.outputs.fix == 'true' || steps.decide.outputs.fix == 'revert'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.decide.outputs.sha }}
@@ -345,6 +367,52 @@ jobs:
               echo
               printf '%s\n' "$summary"
             fi
+            echo
+            echo "<!-- auto-fix: $SHA -->"
+          } | gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -F body=@- > /dev/null
+
+      - name: Revert the cleanup commit
+        id: revert
+        if: steps.decide.outputs.fix == 'revert'
+        env:
+          PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
+          BRANCH: ${{ steps.decide.outputs.branch }}
+          NAMES: ${{ steps.decide.outputs.names }}
+        run: |
+          set -euo pipefail
+          author="Claude <noreply@anthropic.com>"
+          git revert --no-edit --no-commit HEAD
+          {
+            echo "Revert the cleanup pass: it broke $NAMES"
+            echo
+            echo "These checks passed on the commit before the cleanup and failed on it, so"
+            echo "the cleanup is undone instead of fixed."
+            echo
+            echo "Cleanup-pass: reverted"
+          } > "$RUNNER_TEMP/revert-message.txt"
+          git -c user.name="${author% <*}" -c user.email="noreply@users.noreply.github.com" \
+            commit --no-verify -q --author="$author" -F "$RUNNER_TEMP/revert-message.txt"
+          # The same fast-forward push as the fix's, the token in git's environment.
+          auth="$(printf 'x-access-token:%s' "$PAT" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git push -q origin "HEAD:refs/heads/$BRANCH"
+          echo "result=reverted in $(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report the revert on the PR
+        if: always() && steps.decide.outputs.fix == 'revert'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.decide.outputs.number }}
+          SHA: ${{ steps.decide.outputs.sha }}
+          NAMES: ${{ steps.decide.outputs.names }}
+          RESULT: ${{ steps.revert.outputs.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "**Auto-fix**: the cleanup commit ${SHA:0:7} broke $NAMES, which passed before it."
+            echo
+            echo "Result: ${RESULT:-not reverted; the job log has the details}"
             echo
             echo "<!-- auto-fix: $SHA -->"
           } | gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -F body=@- > /dev/null

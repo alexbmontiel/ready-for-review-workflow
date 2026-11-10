@@ -303,6 +303,7 @@ class FixDecide(unittest.TestCase):
         (self.tmp / "gh.json").write_text(json.dumps({
             f"{r}/pulls": prs,
             f"{r}/commits/abc123/check-runs": {"total_count": len(checks), "check_runs": checks},
+            f"{r}/commits/abc123": {"commit": {"message": commit_messages[-1]}, "parents": [{"sha": "parent1"}]},
             **(extra or {}),
             f"{r}/issues/7/comments": [{"body": b} for b in comments],
             f"{r}/pulls/7/commits": [{"commit": {"message": m}} for m in commit_messages],

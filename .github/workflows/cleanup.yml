@@ -1,0 +1,514 @@
+name: Cleanup pass
+# Reusable workflow. A repository that opts in (cleanup: true in
+# alex-mf-montiel/agentic-workflow's review/repos.json) calls it from its
+# review.yml, rendered by scripts/onboard_review.py, as a job the independent
+# review waits for. Cleanup behavior changes here, once, for every repository.
+#
+# Simplifies a PR's code once, before the independent review sees it (HOM-172).
+# It is a first pass on purpose: it never runs again on the PR, so the review
+# and the fixer keep the last word, the review also checks the cleanup's own
+# edits, and nothing can loop between them. A script decides when it runs,
+# never a model. Every time the PR's review workflow runs, the decide step
+# goes on only when
+#   - the PR is still a draft and comes from this repository,
+#   - the run is for the PR's current head commit,
+#   - no independent review has been posted on the PR yet,
+#   - the cleanup hasn't run on it before (a "Cleanup-pass:" commit trailer or
+#     its PR comment), and
+#   - the PR changes at least MIN_LINES lines of code. Code means files lizard
+#     can measure, outside .github/, not marked linguist-vendored or
+#     linguist-generated in .gitattributes, and not minified.
+#
+# Claude, on Opus, edits a copy of the checkout inside review-sandbox, like
+# the fixer: file tools only, no commands, and Edit only for the PR's own code
+# files. Its instructions follow Anthropic's code-simplifier agent
+# (anthropics/claude-plugins-official, plugins/code-simplifier), with the
+# repository's AGENTS.md in place of that agent's own style rules. A script
+# then measures those files before and after with lizard (lines of code,
+# cyclomatic complexity, duplication) and keeps the change only if nothing
+# got worse and something improved. It commits only those files, refuses a
+# model login token, pushes with READY_FOR_REVIEW_PAT and comments with the
+# numbers. A push starts a new run of the review workflow, whose review covers
+# the cleaned-up code, so this run's review is skipped (the pushed output).
+# If the cleanup commit breaks a check that passed before it, fix.yml reverts
+# it instead of fixing it.
+#
+# Every step has continue-on-error, and Claude's step its own timeout: a
+# cleanup problem never fails a check, because a failed check would block the
+# PR and start the fixer. The job log and the PR comment say what happened.
+#
+# The caller gives this job its own concurrency group, without
+# cancel-in-progress, so a newer push never cancels a cleanup halfway: the
+# newer run waits, then sees the finished cleanup and skips. A cleanup whose
+# push is refused because the branch moved leaves no marker, so the newer
+# commit's run tries again.
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: The calling repository's HP review runner label, e.g. homeassistant-review-hp.
+        type: string
+        required: true
+    outputs:
+      pushed:
+        description: "'true' when this run pushed a cleanup commit; the review then runs on that commit's own run."
+        value: ${{ jobs.cleanup.outputs.pushed }}
+    secrets:
+      READY_FOR_REVIEW_PAT:
+        description: Classic PAT with repo scope; pushes the cleanup so CI and the review run on it.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  cleanup:
+    runs-on: [self-hosted, Linux, X64, "${{ inputs.runner_label }}"]
+    timeout-minutes: 25
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      - name: Decide whether to clean up
+        id: decide
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          number = os.environ["NUMBER"]
+          MARKER = "<!-- cleanup-pass -->"
+
+          def api(path):
+              return json.loads(subprocess.run(["gh", "api", path], check=True,
+                                               capture_output=True, text=True).stdout)
+
+          def pages(path):
+              items, page = [], 1
+              while True:
+                  batch = api(f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+                  items += batch
+                  if len(batch) < 100:
+                      return items
+                  page += 1
+
+          def output(**values):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  for key, value in values.items():
+                      fh.write(f"{key}={value}\n")
+
+          def skip(reason):
+              print(reason)
+              output(run="false")
+              raise SystemExit(0)
+
+          pr = api(f"repos/{repo}/pulls/{number}")
+          if pr["state"] != "open":
+              skip(f"PR #{number} isn't open.")
+          if not pr["draft"]:
+              skip(f"PR #{number} is ready for review, so it's the owner's now.")
+          if (pr["head"].get("repo") or {}).get("full_name") != repo:
+              skip(f"PR #{number} comes from another repository.")
+          if pr["head"]["sha"] != os.environ["EVENT_SHA"]:
+              skip("A newer commit is on the PR; its own run decides.")
+          for c in pages(f"repos/{repo}/issues/{number}/comments"):
+              body = c["body"] or ""
+              if MARKER in body:
+                  skip(f"The cleanup already ran on PR #{number}.")
+              if (c["user"] or {}).get("login") == "github-actions[bot]" and body.startswith("**Independent review**"):
+                  skip(f"The independent review has started on PR #{number}, and the cleanup only runs before it.")
+          for c in pages(f"repos/{repo}/pulls/{number}/commits"):
+              if any(line.startswith("Cleanup-pass:") for line in c["commit"]["message"].splitlines()):
+                  skip(f"The cleanup already ran on PR #{number}.")
+          output(run="true", sha=pr["head"]["sha"], branch=pr["head"]["ref"], base=pr["base"]["ref"])
+          PY
+
+      - if: steps.decide.outputs.run == 'true'
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          ref: ${{ steps.decide.outputs.sha }}
+          # The cleanup diffs the PR against its base branch.
+          fetch-depth: 0
+          # Nothing reads a token from .git/config: the push below passes its
+          # own, and Claude's copy of the checkout must not hold one.
+          persist-credentials: false
+
+      - name: Install lizard
+        id: install
+        if: steps.decide.outputs.run == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # lizard and its two dependencies, pinned by hash. The virtualenv and
+          # the scripts that use it live outside the directory review-sandbox
+          # lets Claude write, so Claude can't change code that runs outside
+          # the sandbox. Every python that reads the PR's files runs with -I:
+          # isolated mode never imports from the current or script directory,
+          # where a PR or Claude could plant a lizard.py.
+          VENV="$RUNNER_TEMP/cleanup-lizard"
+          rm -rf "$VENV"
+          python3 -m venv "$VENV"
+          cat > "$RUNNER_TEMP/cleanup-requirements.txt" <<'EOF'
+          lizard==1.24.3 --hash=sha256:f7fccd909719170e323a240cc6927bfea65984d77a8f9c0e6405be582e9861db
+          pathspec==1.1.1 --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+          pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+          EOF
+          "$VENV/bin/pip" install --quiet --disable-pip-version-check --require-hashes --only-binary :all: \
+            --no-deps -r "$RUNNER_TEMP/cleanup-requirements.txt"
+
+      - name: Pick the PR's code files
+        id: select
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.decide.outputs.base }}
+        run: |
+          set -euo pipefail
+          VENV="$RUNNER_TEMP/cleanup-lizard"
+          OUT="$RUNNER_TEMP/cleanup-out"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          # measure ROOT FILES.json: lizard's numbers for those files under ROOT.
+          cat > "$RUNNER_TEMP/cleanup_measure.py" <<'PY'
+          import contextlib, io, json, os, re, sys
+          import lizard
+
+          def measure(root, files):
+              nloc = ccn = worst = 0
+              for path in files:
+                  info = lizard.analyze_file(os.path.join(root, path))
+                  nloc += info.nloc
+                  for function in info.function_list:
+                      ccn += function.cyclomatic_complexity
+                      worst = max(worst, function.cyclomatic_complexity)
+              # lizard's duplicate detector only reports through its command line.
+              here = os.getcwd()
+              os.chdir(root)
+              text = io.StringIO()
+              try:
+                  with contextlib.redirect_stdout(text):
+                      lizard.main(["lizard", "--working_threads", "1", "-Eduplicate", *files])
+              except SystemExit:
+                  pass
+              finally:
+                  os.chdir(here)
+              found = re.search(r"Total duplicate rate: ([0-9.]+)%", text.getvalue())
+              return {"nloc": nloc, "ccn": ccn, "worst": worst, "dup": float(found.group(1)) if found else 0.0}
+
+          if __name__ == "__main__":
+              with open(sys.argv[2]) as fh:
+                  print(json.dumps(measure(sys.argv[1], json.load(fh))))
+          PY
+
+          "$VENV/bin/python" -I - "$OUT" <<'PY'
+          import json, os, re, subprocess, sys
+          from lizard_languages import get_reader_for
+
+          MIN_LINES = 40
+          # Paths that are safe to put in a Claude Code permission rule.
+          SAFE = re.compile(r"[A-Za-z0-9._/-]+")
+          out = sys.argv[1]
+
+          def output(**values):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  for key, value in values.items():
+                      fh.write(f"{key}={value}\n")
+
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+          def minified(path):
+              try:
+                  with open(path, errors="replace") as fh:
+                      return any(len(line) > 500 for line in fh)
+              except OSError:
+                  return True
+
+          raw = git("diff", "-z", "--numstat", "--no-renames", "--diff-filter=AM",
+                    f"origin/{os.environ['BASE']}...HEAD")
+          candidates = []
+          for entry in raw.split("\0"):
+              if not entry:
+                  continue
+              added, deleted, path = entry.split("\t", 2)
+              if added == "-" or path.startswith(".github/") or not SAFE.fullmatch(path):
+                  continue
+              if get_reader_for(path) is None or minified(path):
+                  continue
+              candidates.append((path, int(added) + int(deleted)))
+          # Vendored and generated files are the repository's to mark, in
+          # .gitattributes (GitHub's linguist attributes).
+          marked = set()
+          if candidates:
+              attrs = subprocess.run(["git", "check-attr", "-z", "linguist-vendored", "linguist-generated", "--",
+                                      *(p for p, _ in candidates)], check=True, capture_output=True, text=True).stdout
+              fields = attrs.split("\0")
+              for path, _, value in zip(fields[0::3], fields[1::3], fields[2::3]):
+                  if value in ("set", "true"):
+                      marked.add(path)
+          files = [p for p, _ in candidates if p not in marked]
+          lines = sum(n for p, n in candidates if p not in marked)
+          with open(os.path.join(out, "files.json"), "w") as fh:
+              json.dump(files, fh)
+          if lines < MIN_LINES:
+              print(f"The PR changes {lines} lines of code, under {MIN_LINES}, so there's nothing to clean up.")
+              output(go="false")
+          else:
+              print(f"Cleaning up {len(files)} files ({lines} changed lines): {', '.join(files)}")
+              output(go="true", files=len(files), lines=lines)
+          PY
+
+      - name: Clean up (Claude)
+        id: cleanup
+        if: steps.select.outputs.go == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        # No push token in this step: only Claude runs here.
+        env:
+          BASE: ${{ steps.decide.outputs.base }}
+        run: |
+          set -euo pipefail
+          command -v review-sandbox > /dev/null || {
+            echo "review-sandbox isn't installed on this runner; run homeassistant's infrastructure/hp-k3s/review-sandbox.yml" >&2
+            exit 1
+          }
+          OUT="$RUNNER_TEMP/cleanup-out"
+          WORK="$OUT/work"
+          mapfile -t files < <(jq -r '.[]' "$OUT/files.json")
+          git diff "origin/$BASE...HEAD" -- "${files[@]}" > "$RUNNER_TEMP/cleanup-pr.diff"
+          # One argument can't exceed 128 KB on Linux.
+          PR_DIFF="$(head -c 60000 "$RUNNER_TEMP/cleanup-pr.diff")"
+          if [ "$(wc -c < "$RUNNER_TEMP/cleanup-pr.diff")" -gt 60000 ]; then PR_DIFF="$PR_DIFF
+          (diff truncated)"; fi
+          FILE_LIST="$(printf -- '- %s\n' "${files[@]}")"
+
+          PROMPT="Clean up this pull request's code before it is reviewed: make it simpler and clearer without changing what it does.
+
+          Work only on these files, which the PR changed:
+          $FILE_LIST
+
+          In them, change only code the PR added or changed (its diff is below), and anything that code made redundant. Follow the repository's AGENTS.md or CLAUDE.md.
+
+          Do:
+          - reduce nesting and needless indirection, for example with early returns;
+          - remove dead code, duplicated logic, and abstractions with one caller that add nothing;
+          - remove comments that only restate the code, and keep the ones that explain why;
+          - give local variables and private helpers clear names.
+
+          Don't:
+          - change behavior, outputs, error handling, or what the tests check;
+          - rename or change anything other files use, such as public functions, classes, command-line options, configuration keys or file names;
+          - trade readability for fewer lines: no dense one-liners, nested conditional expressions or clever tricks;
+          - add features, dependencies, or comments about your own edits;
+          - reformat code you aren't otherwise changing.
+
+          Changing nothing is a fine outcome when nothing is clearly worth changing. End with up to five short bullet points on what you changed and why, or one sentence on why you changed nothing.
+
+          ## The PR's change (git diff origin/$BASE...HEAD)
+
+          $PR_DIFF"
+
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cp -a "$GITHUB_WORKSPACE/." "$WORK/"
+          # The same token check as fix.yml's: everything of Claude's that gets
+          # published (its summary and its diff) is checked for a model login
+          # token first. It sits outside the sandbox's view. Exit status 1 means
+          # a token was found.
+          cat > "$RUNNER_TEMP/no_login_token.py" <<'PY'
+          import json, os, sys
+          text = sys.stdin.read()
+          def strings(value):
+              if isinstance(value, dict):
+                  for v in value.values():
+                      yield from strings(v)
+              elif isinstance(value, list):
+                  for v in value:
+                      yield from strings(v)
+              elif isinstance(value, str) and len(value) >= 20 and " " not in value:
+                  yield value
+          for path, part in (("~/.codex/auth.json", None),
+                             ("~/.claude/.credentials.json", None),
+                             ("~/.claude/settings.json", "env")):
+              try:
+                  with open(os.path.expanduser(path)) as fh:
+                      login = json.load(fh)
+              except (OSError, ValueError):
+                  continue
+              if part:
+                  login = login.get(part) if isinstance(login, dict) else None
+              if any(s in text for s in strings(login)):
+                  sys.exit(1)
+          PY
+          # File tools only, as for the fixer (see fix.yml): reading anywhere in
+          # the copy, editing only the PR's own code files, and no commands.
+          ALLOW="Read(/$WORK/**),Grep(/$WORK/**),Glob(/$WORK/**)"
+          for f in "${files[@]}"; do ALLOW="$ALLOW,Edit(/$WORK/$f)"; done
+          # review-sandbox starts in the checkout; the inner sh moves to the copy.
+          # shellcheck disable=SC2016
+          if review-sandbox claude "$GITHUB_WORKSPACE" "$OUT" -- \
+              sh -c 'cd "$1" && shift && exec "$@"' sh "$WORK" \
+              claude -p "$PROMPT" --model opus --effort medium --allowedTools "$ALLOW" \
+              --disallowedTools "Bash,Write,NotebookEdit,WebFetch,WebSearch" \
+              --permission-mode dontAsk --no-session-persistence --output-format text \
+              > "$OUT/summary.txt" 2> "$RUNNER_TEMP/cleanup_err.txt" < /dev/null; then
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Claude failed (status $?)" >&2
+            cat "$RUNNER_TEMP/cleanup_err.txt" >&2
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+          fi
+          if ! python3 "$RUNNER_TEMP/no_login_token.py" < "$OUT/summary.txt"; then
+            echo "(Claude's summary is withheld: it contained a model login token.)" > "$OUT/summary.txt"
+          fi
+
+      - name: Keep the change if the numbers improved
+        id: keep
+        if: steps.cleanup.outputs.ran == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/cleanup-out"
+          VENV="$RUNNER_TEMP/cleanup-lizard"
+          result() { echo "result=$1" >> "$GITHUB_OUTPUT"; echo "$1"; }
+          mapfile -t files < <(jq -r '.[]' "$OUT/files.json")
+          # Stage only the PR's code files from Claude's copy, against the
+          # checkout's own .git: anything else in the copy is ignored.
+          git --work-tree="$OUT/work" add -- "${files[@]}"
+          if git diff --cached --quiet; then
+            result "no change"
+            exit 0
+          fi
+          if ! git diff --cached | python3 "$RUNNER_TEMP/no_login_token.py"; then
+            git reset -q
+            result "not kept: the change contained a model login token"
+            exit 0
+          fi
+          "$VENV/bin/python" -I "$RUNNER_TEMP/cleanup_measure.py" "$GITHUB_WORKSPACE" "$OUT/files.json" > "$OUT/before.json"
+          "$VENV/bin/python" -I "$RUNNER_TEMP/cleanup_measure.py" "$OUT/work" "$OUT/files.json" > "$OUT/after.json"
+          python3 - "$OUT" <<'PY'
+          import json, os, sys
+          out = sys.argv[1]
+          with open(os.path.join(out, "before.json")) as fh:
+              b = json.load(fh)
+          with open(os.path.join(out, "after.json")) as fh:
+              a = json.load(fh)
+          rows = [("Lines of code", "nloc", "{}"), ("Complexity, all functions", "ccn", "{}"),
+                  ("Most complex function", "worst", "{}"), ("Duplicated code", "dup", "{:.1f}%")]
+          # Duplication is a rate that moves a little whenever code moves, so
+          # half a point either way counts as no change.
+          worse = [name for name, key, _ in rows
+                   if a[key] > b[key] + (0.5 if key == "dup" else 0)]
+          better = [name for name, key, _ in rows
+                    if a[key] < b[key] - (0.5 if key == "dup" else 0)]
+          table = ["| | Before | After |", "|---|---:|---:|"]
+          table += [f"| {name} | {fmt.format(b[key])} | {fmt.format(a[key])} |" for name, key, fmt in rows]
+          with open(os.path.join(out, "numbers.md"), "w") as fh:
+              fh.write("\n".join(table) + "\n")
+          if worse:
+              verdict = "not kept: it made these worse: " + ", ".join(worse).lower()
+          elif not better:
+              verdict = "not kept: none of the numbers improved"
+          else:
+              verdict = "keep"
+          with open(os.path.join(out, "verdict.txt"), "w") as fh:
+              fh.write(verdict)
+          PY
+          verdict="$(cat "$OUT/verdict.txt")"
+          if [ "$verdict" != keep ]; then
+            git reset -q
+            result "$verdict"
+            exit 0
+          fi
+          author="Claude <noreply@anthropic.com>"
+          {
+            echo "Clean up the PR's code before review"
+            echo
+            head -c 1500 "$OUT/summary.txt" 2> /dev/null || true
+            echo
+            echo
+            cat "$OUT/numbers.md"
+            echo
+            echo "Cleanup-pass: applied"
+          } > "$RUNNER_TEMP/cleanup-message.txt"
+          git -c user.name="${author% <*}" -c user.email="noreply@users.noreply.github.com" \
+            commit --no-verify -q --author="$author" -F "$RUNNER_TEMP/cleanup-message.txt"
+          echo "commit=true" >> "$GITHUB_OUTPUT"
+          result "kept"
+
+      - name: Push the cleanup
+        id: push
+        if: steps.keep.outputs.commit == 'true'
+        continue-on-error: true
+        env:
+          PAT: ${{ secrets.READY_FOR_REVIEW_PAT }}
+          BRANCH: ${{ steps.decide.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # A plain fast-forward push: if the branch moved since this run
+          # started, it's refused, and the new commit's own run decides again.
+          # The token reaches git through its environment, never as an argument
+          # (see fix.yml).
+          auth="$(printf 'x-access-token:%s' "$PAT" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git push -q origin "HEAD:refs/heads/$BRANCH"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report on the PR
+        id: report
+        # Once Claude has run, whatever happened, so the comment marks the PR
+        # as cleaned up and no later run tries again - except when the push
+        # was refused, so the newer commit's run can.
+        if: ${{ !cancelled() && steps.cleanup.outcome != 'skipped' && steps.cleanup.outcome != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          RAN: ${{ steps.cleanup.outputs.ran }}
+          RESULT: ${{ steps.keep.outputs.result }}
+          COMMITTED: ${{ steps.keep.outputs.commit }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          COMMIT: ${{ steps.push.outputs.commit }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/cleanup-out"
+          marker="<!-- cleanup-pass -->"
+          if [ "$PUSHED" = true ]; then
+            outcome="Pushed $COMMIT. The independent review runs on the cleaned-up code."
+          elif [ "$COMMITTED" = true ]; then
+            outcome="Not pushed: the push was refused, probably because the branch moved. The newest commit's run tries again."
+            marker=""
+          elif [ "$RAN" != true ]; then
+            outcome="Nothing changed: Claude didn't finish. The job log has the details."
+          elif [ "$RESULT" = "no change" ]; then
+            outcome="Nothing changed: there was nothing worth simplifying."
+          else
+            outcome="Nothing changed: ${RESULT:-the change could not be checked, and the job log has the details}."
+          fi
+          summary="$(head -c 3000 "$OUT/summary.txt" 2> /dev/null || true)"
+          {
+            echo "**Cleanup pass** (Claude) - $outcome"
+            if [ -s "$OUT/numbers.md" ]; then
+              echo
+              cat "$OUT/numbers.md"
+            fi
+            if [ -n "$summary" ]; then
+              echo
+              printf '%s\n' "$summary"
+            fi
+            if [ -n "$marker" ]; then
+              echo
+              echo "It runs once per PR, before the review, and doesn't run again."
+              echo
+              echo "$marker"
+            fi
+          } | gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -F body=@- > /dev/null
